@@ -1,4 +1,4 @@
-# Anime Watch Planner for AniList
+# Anime Planner for AniList
 
 A companion app for your AniList anime list on iOS and Android. It helps you keep the list up to date and
 suggests what to watch next.
