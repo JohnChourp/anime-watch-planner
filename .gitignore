@@ -1,0 +1,25 @@
+.DS_Store
+node_modules/
+dist/
+www/
+.angular/
+coverage/
+android/app/build/
+.gradle/
+
+# Secrets never go into the repository
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.p8
+AuthKey_*
+google-services.json
+GoogleService-Info.plist
+serviceAccount*.json
+*-service-account*.json
+*.apk
+*.aab
