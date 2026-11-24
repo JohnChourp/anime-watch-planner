@@ -1,4 +1,4 @@
-.empty-state {
+.state {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -20,4 +20,15 @@
     color: var(--ion-color-medium);
     font-size: var(--app-font-body);
   }
+
+  .message {
+    color: var(--ion-color-danger);
+  }
+}
+
+.action {
+  min-width: 220px;
+  min-height: var(--app-touch-min);
+  margin-top: var(--app-space-4);
+  --border-radius: var(--app-radius-m);
 }
