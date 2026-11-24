@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
 import { IonButton, IonContent, IonHeader, IonSpinner, IonTitle, IonToolbar } from '@ionic/angular';
 
 import { AuthService } from '../../core/auth/auth.service';
@@ -12,4 +12,9 @@ import { AuthService } from '../../core/auth/auth.service';
 })
 export class HomePage {
   protected readonly auth = inject(AuthService);
+  protected readonly signedInTitle = computed(() => {
+    const viewer = this.auth.viewer();
+    return viewer ? `Signed in as ${viewer.name}` : 'Signed in to AniList';
+  });
+  protected readonly signingIn = computed(() => this.auth.status() === 'signingIn');
 }

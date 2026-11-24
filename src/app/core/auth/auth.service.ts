@@ -7,7 +7,8 @@ import { authorizeUrl, parseAuthRedirect, type StoredToken } from './auth-redire
 
 export type AuthStatus = 'loading' | 'signedOut' | 'signingIn' | 'signedIn';
 
-export const FETCH = Symbol('fetch');
+/** A redirect is accepted only within this time after the user tapped "Sign in". */
+const SIGN_IN_WINDOW_MS = 15 * 60 * 1000;
 
 @Injectable({ providedIn: 'root' })
 export class AuthService {
@@ -18,7 +19,7 @@ export class AuthService {
 
   readonly status = signal<AuthStatus>('loading');
   readonly viewer = signal<Viewer | null>(null);
-  /** A short, plain message for the sign-in screen (expired session, cancelled sign-in, …). */
+  /** A short, plain message for the sign-in screen (expired session, failed sign-in, …). */
   readonly message = signal<string | null>(null);
 
   /** For tests only. */
@@ -32,29 +33,47 @@ export class AuthService {
       return;
     }
     this.started = true;
-    await this.platform.onRedirect((url) => void this.handleRedirect(url));
-    await this.platform.onSignInClosed(() => this.cancelSignIn());
-
-    const saved = await this.platform.readToken();
-    if (!saved) {
-      this.status.set('signedOut');
-      return;
+    try {
+      await this.platform.onRedirect((url) => void this.handleRedirect(url));
+      await this.platform.onSignInClosed(() => this.cancelSignIn());
+    } catch {
+      // Without the listeners sign-in cannot finish, but a saved session still works.
     }
-    if (saved.expiresAt <= now) {
+
+    let saved: StoredToken | null = null;
+    try {
+      saved = await this.platform.readToken();
+    } catch {
+      // Unreadable secure storage (e.g. Android Keystore key reset after a screen-lock change).
+      await this.signOut().catch(() => undefined);
+      this.message.set('Please sign in again.');
+    }
+    if (saved && saved.expiresAt <= now) {
       await this.expire();
-      return;
+    } else if (saved) {
+      this.token = saved;
+      this.status.set('signedIn');
+      await this.loadViewer();
+    } else if (this.status() === 'loading') {
+      this.status.set('signedOut');
     }
-    this.token = saved;
-    this.status.set('signedIn');
-    await this.loadViewer();
+
+    // The redirect may have cold-started the app (Android can kill it while the AniList page is open).
+    const launchUrl = await this.platform.launchUrl().catch(() => null);
+    if (launchUrl) {
+      await this.handleRedirect(launchUrl, now);
+    }
   }
 
-  /** The AniList Bearer token for API calls, or null when signed out. */
+  /** The AniList Bearer token for API calls, or null when signed out. An expired token signs the user out. */
   accessToken(now = Date.now()): string | null {
-    return this.token && this.token.expiresAt > now ? this.token.accessToken : null;
+    if (this.token && this.token.expiresAt <= now) {
+      void this.expire();
+    }
+    return this.token?.accessToken ?? null;
   }
 
-  async signIn(): Promise<void> {
+  async signIn(now = Date.now()): Promise<void> {
     if (!ANILIST.clientId) {
       this.message.set('Sign-in is not set up yet: the AniList client id is missing.');
       return;
@@ -62,7 +81,9 @@ export class AuthService {
     this.message.set(null);
     this.status.set('signingIn');
     try {
-      await this.platform.openSignIn(authorizeUrl());
+      const state = crypto.randomUUID();
+      await this.platform.writePending({ state, startedAt: now });
+      await this.platform.openSignIn(authorizeUrl(state));
     } catch {
       this.status.set('signedOut');
       this.message.set('Could not open the AniList sign-in page.');
@@ -76,18 +97,36 @@ export class AuthService {
     }
   }
 
+  /**
+   * Handles `com.john.animewatchplanner://auth…`. Accepted only for a sign-in the user started on this
+   * device in the last 15 minutes, and only with the same `state` when AniList sends one back, so a link
+   * from a web page or another app cannot sign the user in to someone else's account.
+   */
   async handleRedirect(url: string, now = Date.now()): Promise<void> {
     const result = parseAuthRedirect(url, now);
     if (!result) {
       return;
     }
+    const pending = await this.platform.readPending().catch(() => null);
+    const expected = pending && now - pending.startedAt <= SIGN_IN_WINDOW_MS ? pending.state : null;
+    if (!expected || (result.state !== null && result.state !== expected)) {
+      return;
+    }
+    await this.platform.deletePending().catch(() => undefined);
     await this.platform.closeSignIn();
+
     if (result.kind === 'error') {
       this.status.set('signedOut');
       this.message.set(`Sign-in did not finish: ${result.reason}`);
       return;
     }
-    await this.platform.writeToken(result.token);
+    try {
+      await this.platform.writeToken(result.token);
+    } catch {
+      this.status.set('signedOut');
+      this.message.set('Could not save the sign-in on this device. Please try again.');
+      return;
+    }
     this.token = result.token;
     this.message.set(null);
     this.status.set('signedIn');
@@ -96,16 +135,19 @@ export class AuthService {
 
   /** Signs out on this device: forgets the token. (The list cache is cleared here too once it exists, 3.1.) */
   async signOut(): Promise<void> {
-    await this.platform.deleteToken();
-    this.token = null;
-    this.viewer.set(null);
-    this.message.set(null);
-    this.status.set('signedOut');
+    try {
+      await this.platform.deleteToken();
+    } finally {
+      this.token = null;
+      this.viewer.set(null);
+      this.message.set(null);
+      this.status.set('signedOut');
+    }
   }
 
   /** Any AniList call that gets a 401 calls this: the user signs in again, with a clear message. */
   async expire(): Promise<void> {
-    await this.signOut();
+    await this.signOut().catch(() => undefined);
     this.message.set('Your AniList session has ended. Please sign in again.');
   }
 

@@ -6,7 +6,17 @@ export interface StoredToken {
   expiresAt: number;
 }
 
-export type AuthRedirect = { kind: 'token'; token: StoredToken } | { kind: 'error'; reason: string };
+/** A sign-in the user started: its random `state`, sent to AniList and expected back. */
+export interface PendingSignIn {
+  state: string;
+  /** Epoch milliseconds. */
+  startedAt: number;
+}
+
+export type AuthRedirect = ({ kind: 'token'; token: StoredToken } | { kind: 'error'; reason: string }) & {
+  /** The `state` AniList sent back, if any. */
+  state: string | null;
+};
 
 /**
  * Reads the AniList Implicit Grant redirect, e.g.
@@ -27,19 +37,20 @@ export function parseAuthRedirect(url: string, now = Date.now()): AuthRedirect |
     hashIndex >= 0 ? url.slice(hashIndex + 1) : queryIndex >= 0 ? url.slice(queryIndex + 1) : '',
   );
 
+  const state = params.get('state');
   const error = params.get('error');
   if (error) {
-    return { kind: 'error', reason: params.get('error_description') ?? error };
+    return { kind: 'error', reason: params.get('error_description') ?? error, state };
   }
   const accessToken = params.get('access_token');
   const expiresIn = Number(params.get('expires_in'));
   if (!accessToken || !Number.isFinite(expiresIn) || expiresIn <= 0) {
-    return { kind: 'error', reason: 'AniList did not return a sign-in token.' };
+    return { kind: 'error', reason: 'AniList did not return a sign-in token.', state };
   }
-  return { kind: 'token', token: { accessToken, expiresAt: now + expiresIn * 1000 } };
+  return { kind: 'token', token: { accessToken, expiresAt: now + expiresIn * 1000 }, state };
 }
 
-export function authorizeUrl(): string {
-  const params = new URLSearchParams({ client_id: ANILIST.clientId, response_type: 'token' });
+export function authorizeUrl(state: string): string {
+  const params = new URLSearchParams({ client_id: ANILIST.clientId, response_type: 'token', state });
   return `${ANILIST.authorizeUrl}?${params.toString()}`;
 }
