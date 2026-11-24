@@ -11,8 +11,28 @@
     </ion-toolbar>
   </ion-header>
 
-  <section class="empty-state">
-    <h2>Your AniList list will live here</h2>
-    <p>Sign in with AniList is the next step.</p>
+  @switch (auth.status()) { @case ('loading') {
+  <section class="state">
+    <ion-spinner name="crescent" aria-label="Loading"></ion-spinner>
   </section>
+  } @case ('signedIn') {
+  <section class="state">
+    <h2>@if (auth.viewer(); as viewer) { Signed in as {{ viewer.name }} } @else { Signed in to AniList }</h2>
+    <p>Your list comes next.</p>
+    <ion-button class="action" fill="outline" (click)="auth.signOut()">Sign out</ion-button>
+  </section>
+  } @default {
+  <section class="state">
+    <h2>Your AniList list will live here</h2>
+    <p>Sign in to plan what to watch next. Your list stays on AniList.</p>
+    @if (auth.message(); as message) {
+    <p class="message" role="status">{{ message }}</p>
+    }
+    <ion-button class="action" [disabled]="auth.status() === 'signingIn'" (click)="auth.signIn()">
+      @if (auth.status() === 'signingIn') {
+      <ion-spinner name="dots" aria-hidden="true"></ion-spinner>
+      } @else { Sign in with AniList }
+    </ion-button>
+  </section>
+  } }
 </ion-content>
