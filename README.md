@@ -11,8 +11,9 @@ Needs Node 22.22+, 24.15+ or 26+, Xcode for iOS and Android Studio for Android.
 
 ```bash
 npm ci
+npx playwright install chromium   # once per machine, for the e2e test
 npm start              # in the browser
-npm run lint && npm run test:unit
+npm run lint && npm test
 npm run build && npx cap sync
 npx cap run ios        # or: npx cap run android
 ```

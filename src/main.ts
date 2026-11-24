@@ -14,7 +14,8 @@ import { routes } from './app/app.routes';
 bootstrapApplication(AppComponent, {
   providers: [
     { provide: RouteReuseStrategy, useClass: IonicRouteStrategy },
-    provideIonicAngular(),
+    // Honour the system "reduce motion" setting for Ionic's own page and modal transitions too.
+    provideIonicAngular({ animated: !window.matchMedia('(prefers-reduced-motion: reduce)').matches }),
     provideRouter(routes, withPreloading(PreloadAllModules), withComponentInputBinding()),
   ],
 });

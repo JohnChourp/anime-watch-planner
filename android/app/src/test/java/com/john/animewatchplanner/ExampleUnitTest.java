@@ -1,4 +1,4 @@
-package com.getcapacitor.myapp;
+package com.john.animewatchplanner;
 
 import static org.junit.Assert.*;
 
