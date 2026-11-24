@@ -3,8 +3,20 @@
 A companion app for your AniList anime list on iOS and Android. It helps you keep the list up to date and
 suggests what to watch next.
 
-> **Status: planning.** There is no application code yet. This repository is a placeholder while the
-> project is designed in phases.
+> **Status: early development.** The app shell runs on iOS and Android; sign-in and the list come next.
+
+## Run it locally
+
+Needs Node 22.22+, 24.15+ or 26+, Xcode for iOS and Android Studio for Android.
+
+```bash
+npm ci
+npx playwright install chromium   # once per machine, for the e2e test
+npm start              # in the browser
+npm run lint && npm test
+npm run build && npx cap sync
+npx cap run ios        # or: npx cap run android
+```
 
 ## What it will do
 
@@ -29,8 +41,8 @@ suggests what to watch next.
   [AniList API](https://docs.anilist.co) from your device with your own sign-in. It keeps a local cache of
   your own list, refreshed when it is about a month old or when you ask. It respects AniList's rate limits
   and never bulk-copies AniList's database.
-- **Firebase** keeps only what AniList does not: your deferrals, suggestion rules and preferences. It never
-  holds a copy of your list.
+- **Your extras stay on your phone:** deferrals, suggestion rules and preferences are kept on the device.
+  There is no app server and no copy of your list anywhere else.
 - **Built with care:** simplicity, good UI, good design and smooth animations.
 
 ## Credits

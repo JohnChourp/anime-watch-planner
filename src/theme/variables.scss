@@ -1,0 +1,40 @@
+// Design tokens for Anime Planner for AniList.
+// Reuse these everywhere instead of literal sizes, radii or timings.
+// Ionic colour theming: https://ionicframework.com/docs/theming/
+
+:root {
+  // Brand colour (AniList-friendly blue). Ionic derives shades and contrast from it.
+  --ion-color-primary: #3577f1;
+  --ion-color-primary-rgb: 53, 119, 241;
+  --ion-color-primary-contrast: #ffffff;
+  --ion-color-primary-contrast-rgb: 255, 255, 255;
+  --ion-color-primary-shade: #2f69d4;
+  --ion-color-primary-tint: #4985f2;
+
+  // Spacing scale (4 px steps).
+  --app-space-1: 4px;
+  --app-space-2: 8px;
+  --app-space-3: 12px;
+  --app-space-4: 16px;
+  --app-space-5: 24px;
+  --app-space-6: 32px;
+
+  // Corner radius.
+  --app-radius-s: 8px;
+  --app-radius-m: 12px;
+  --app-radius-l: 20px;
+
+  // Type scale. rem values follow the system font size (Dynamic Type / font scaling).
+  --app-font-caption: 0.8125rem;
+  --app-font-body: 1rem;
+  --app-font-title: 1.25rem;
+  --app-font-headline: 1.75rem;
+
+  // Motion: short, natural easing; transform and opacity only.
+  --app-motion-short: 150ms;
+  --app-motion-medium: 250ms;
+  --app-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  // Minimum touch target (44 pt iOS / 48 dp Android).
+  --app-touch-min: 48px;
+}
