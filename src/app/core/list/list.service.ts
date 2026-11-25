@@ -4,15 +4,18 @@ import { App } from '@capacitor/app';
 import { UnauthorizedError } from '../auth/anilist-viewer';
 import { AuthService } from '../auth/auth.service';
 
-import { fetchList, RateLimitedError, type ListEntry } from './anilist-list';
+import { fetchChanges, fetchList, RateLimitedError, type ListEntry } from './anilist-list';
 import { CACHE_VERSION, ListStore, type CachedList } from './list-store';
 
 /** The "monthly" refresh: a saved list older than this is fetched again in full. */
 export const LIST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** A fresh list is checked for changes on start or resume, at most this often. */
+export const CHANGES_INTERVAL_MS = 15 * 60 * 1000;
 
 /**
  * The user's AniList list, kept on the device. It loads the saved copy at once and fetches the whole list again
- * when there is none, when it is 30 days old, or when the user pulls to refresh. Sign-out deletes it.
+ * when there is none, when it is 30 days old, or when the user pulls to refresh. Otherwise, on start or resume and
+ * at most every 15 minutes, it asks AniList only for the entries changed since. Sign-out deletes it.
  */
 @Injectable({ providedIn: 'root' })
 export class ListService {
@@ -26,8 +29,10 @@ export class ListService {
   private generation = 0;
 
   readonly entries = signal<ListEntry[] | null>(null);
-  /** When the list was last fetched in full (device time, ms), or null. */
+  /** When the list was last fetched in full (device time, ms), or null: the 30-day clock, not "updated …". */
   readonly fetchedAt = signal<number | null>(null);
+  /** When the list was last fetched in full or checked for changes (device time, ms), or null. */
+  readonly checkedAt = signal<number | null>(null);
   readonly refreshing = signal(false);
   /** A short, plain message when the list could not be fetched. */
   readonly message = signal<string | null>(null);
@@ -50,7 +55,7 @@ export class ListService {
     void App.addListener('resume', () => this.resume()).catch(() => undefined);
   }
 
-  /** Back from the background: refresh the clock, and the list if it is now 30 days old. */
+  /** Back from the background: refresh the clock, then check the list (30 days old, or 15 minutes since a check). */
   resume(now = Date.now()): void {
     this.now.set(now);
     if (this.auth.status() === 'signedIn') {
@@ -82,7 +87,10 @@ export class ListService {
     });
   }
 
-  /** Signed in: show the saved list at once, then fetch it again if it is missing, stale or someone else's. */
+  /**
+   * Signed in: show the saved list at once, then fetch it again if it is missing, 30 days old or someone else's,
+   * or else check it for changes if the last check was 15 minutes ago or more.
+   */
   async sync(viewerId: number | null, now = Date.now()): Promise<void> {
     const generation = this.generation;
     await this.run(async () => {
@@ -107,6 +115,11 @@ export class ListService {
       const age = this.cache ? now - this.cache.fetchedAt : Infinity;
       if (age >= LIST_TTL_MS || age < 0) {
         await this.fetchAndSave(viewerId, now, generation);
+        return;
+      }
+      const sinceCheck = now - (this.cache?.checkedAt ?? 0);
+      if (sinceCheck >= CHANGES_INTERVAL_MS || sinceCheck < 0) {
+        await this.checkChanges(viewerId, now, generation);
       }
     });
   }
@@ -145,31 +158,79 @@ export class ListService {
         version: CACHE_VERSION,
         userId,
         fetchedAt: now,
-        watermark: entries.reduce((max, e) => Math.max(max, e.updatedAt), 0),
+        checkedAt: now,
+        watermark: highest(entries, 0),
         entries,
       };
       this.loaded = true;
-      this.show(list);
-      await this.store.write(list).catch(() => {
-        // Still shown; the next start fetches it again.
-      });
+      await this.save(list);
     } catch (error) {
-      if (generation !== this.generation) {
-        return;
-      }
-      if (error instanceof UnauthorizedError) {
-        await this.auth.expire();
-      } else if (error instanceof RateLimitedError) {
-        this.message.set('AniList is busy right now. Try again in a minute.');
-      } else {
-        this.message.set(
-          this.cache
-            ? 'Could not update your list. Showing the saved copy.'
-            : 'Could not load your list. Pull down to try again.',
-        );
-      }
+      await this.fail(error, generation);
     } finally {
       this.refreshing.set(false);
+    }
+  }
+
+  /**
+   * Asks AniList only for the entries changed since the last one seen, and puts them into the saved list.
+   * The user did not ask for it, so a failure stays quiet (the next start or resume tries again); 401 still signs out.
+   */
+  private async checkChanges(userId: number, now: number, generation: number): Promise<void> {
+    const cache = this.cache;
+    const token = this.auth.accessToken(now);
+    if (!cache || !token || generation !== this.generation) {
+      return;
+    }
+    this.refreshing.set(true);
+    try {
+      const changed = await fetchChanges(token, userId, cache.watermark, this.fetchFn);
+      if (generation !== this.generation || this.cache !== cache) {
+        return; // Signed out meanwhile.
+      }
+      if (changed !== null) {
+        // By media: an anime removed and added again on the site comes back as a new entry id.
+        const byMedia = new Map(cache.entries.map((e) => [e.media.id, e]));
+        for (const entry of changed) {
+          byMedia.set(entry.media.id, entry);
+        }
+        const watermark = highest(changed, cache.watermark);
+        this.message.set(null);
+        await this.save({ ...cache, checkedAt: now, watermark, entries: [...byMedia.values()] });
+        return;
+      }
+    } catch (error) {
+      if (error instanceof UnauthorizedError && generation === this.generation) {
+        await this.auth.expire();
+      }
+      return;
+    } finally {
+      this.refreshing.set(false);
+    }
+    // More than 10 pages of changes: the whole list is cheaper.
+    await this.fetchAndSave(userId, now, generation);
+  }
+
+  private async save(list: CachedList): Promise<void> {
+    this.show(list);
+    await this.store.write(list).catch(() => {
+      // Still shown; the next start fetches it again.
+    });
+  }
+
+  private async fail(error: unknown, generation: number): Promise<void> {
+    if (generation !== this.generation) {
+      return;
+    }
+    if (error instanceof UnauthorizedError) {
+      await this.auth.expire();
+    } else if (error instanceof RateLimitedError) {
+      this.message.set('AniList is busy right now. Try again in a minute.');
+    } else {
+      this.message.set(
+        this.cache
+          ? 'Could not update your list. Showing the saved copy.'
+          : 'Could not load your list. Pull down to try again.',
+      );
     }
   }
 
@@ -177,5 +238,11 @@ export class ListService {
     this.cache = list;
     this.entries.set(list?.entries ?? null);
     this.fetchedAt.set(list?.fetchedAt ?? null);
+    this.checkedAt.set(list?.checkedAt ?? null);
   }
+}
+
+/** The newest AniList `updatedAt` among the entries, or `floor` if none is newer. */
+function highest(entries: ListEntry[], floor: number): number {
+  return entries.reduce((max, e) => Math.max(max, e.updatedAt), floor);
 }

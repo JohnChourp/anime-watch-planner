@@ -33,14 +33,14 @@ export class HomePage {
   /** "437 anime · updated today", or what is happening while there is no list yet. */
   protected readonly listSummary = computed(() => {
     const entries = this.list.entries();
-    const fetchedAt = this.list.fetchedAt();
-    if (!entries || fetchedAt === null) {
+    const checkedAt = this.list.checkedAt();
+    if (!entries || checkedAt === null) {
       if (this.list.refreshing()) {
         return 'Loading your list…';
       }
       return this.list.message() ? null : 'Pull down to load your list.';
     }
-    return `${entries.length} anime · updated ${updatedLabel(fetchedAt, Math.max(this.list.now(), fetchedAt))}`;
+    return `${entries.length} anime · updated ${updatedLabel(checkedAt, Math.max(this.list.now(), checkedAt))}`;
   });
 
   protected async refresh(event: RefresherCustomEvent): Promise<void> {

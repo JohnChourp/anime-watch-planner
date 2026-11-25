@@ -42,21 +42,33 @@ const MAX_CHUNKS = 20;
 /** A pause between chunks, so a big list does not trip AniList's burst limiter (full limit handling: 3.3). */
 const CHUNK_PAUSE_MS = 1500;
 
+/** The entry fields both queries ask for (decided 2026-11-25: list fields only). */
+const ENTRY_FIELDS = `
+  id status progress repeat updatedAt
+  score(format: POINT_10_DECIMAL)
+  media {
+    id format episodes status season seasonYear
+    title { romaji english }
+    coverImage { large }
+    nextAiringEpisode { episode airingAt }
+  }`;
+
 const QUERY = `query ($userId: Int, $chunk: Int, $perChunk: Int) {
   MediaListCollection(userId: $userId, type: ANIME, chunk: $chunk, perChunk: $perChunk, forceSingleCompletedList: true) {
     hasNextChunk
-    lists {
-      entries {
-        id status progress repeat updatedAt
-        score(format: POINT_10_DECIMAL)
-        media {
-          id format episodes status season seasonYear
-          title { romaji english }
-          coverImage { large }
-          nextAiringEpisode { episode airingAt }
-        }
-      }
-    }
+    lists { entries { ${ENTRY_FIELDS} } }
+  }
+}`;
+
+/** AniList caps perPage at 50. */
+const CHANGES_PER_PAGE = 50;
+/** More changes than 10 pages (500 entries) since the last check: a full refresh is cheaper. */
+const MAX_CHANGE_PAGES = 10;
+
+const CHANGES_QUERY = `query ($userId: Int, $page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage }
+    mediaList(userId: $userId, type: ANIME, sort: UPDATED_TIME_DESC) { ${ENTRY_FIELDS} }
   }
 }`;
 
@@ -80,11 +92,12 @@ interface RawEntry {
   } | null;
 }
 
-interface CollectionResponse {
-  data?: {
-    MediaListCollection?: { hasNextChunk: boolean | null; lists: { entries: RawEntry[] | null }[] | null } | null;
-  };
-  errors?: { status?: number; message?: string }[];
+interface CollectionData {
+  MediaListCollection?: { hasNextChunk: boolean | null; lists: { entries: RawEntry[] | null }[] | null } | null;
+}
+
+interface ChangesData {
+  Page?: { pageInfo: { hasNextPage: boolean | null } | null; mediaList: RawEntry[] | null } | null;
 }
 
 /**
@@ -102,31 +115,10 @@ export async function fetchList(
     if (chunk > 1) {
       await new Promise((resolve) => setTimeout(resolve, pauseMs));
     }
-    const response = await fetchFn(ANILIST.graphqlUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify({ query: QUERY, variables: { userId, chunk, perChunk: PER_CHUNK } }),
-    });
-    if (response.status === 401) {
-      throw new UnauthorizedError();
-    }
-    if (response.status === 429) {
-      throw new RateLimitedError();
-    }
-    const body = (await response.json().catch(() => ({}))) as CollectionResponse;
-    if (body.errors?.some((e) => e.status === 401 || /invalid token/i.test(e.message ?? ''))) {
-      throw new UnauthorizedError();
-    }
-    if (body.errors?.some((e) => e.status === 429)) {
-      throw new RateLimitedError();
-    }
-    const collection = body.data?.MediaListCollection;
-    if (!response.ok || !collection) {
-      throw new Error(`AniList list request failed (${response.status}).`);
+    const variables = { userId, chunk, perChunk: PER_CHUNK };
+    const collection = (await post<CollectionData>(accessToken, QUERY, variables, fetchFn)).MediaListCollection;
+    if (!collection) {
+      throw new Error('AniList list request failed (no list).');
     }
     // Custom lists repeat entries, so keep each entry id once.
     for (const list of collection.lists ?? []) {
@@ -142,6 +134,84 @@ export async function fetchList(
     }
   }
   throw new Error('AniList kept sending more of the list than expected.');
+}
+
+/**
+ * Only the entries changed since `since` (AniList seconds), newest first: pages of 50 until the first entry older
+ * than `since`. Entries changed in the same second as `since` come back again, as AniList counts whole seconds.
+ * Returns null when there are more than 10 pages of changes, so the caller fetches the whole list instead.
+ * Cannot see deleted entries or media changes (a new episode date): the full refresh brings those.
+ * Throws like fetchList.
+ */
+export async function fetchChanges(
+  accessToken: string,
+  userId: number,
+  since: number,
+  fetchFn: typeof fetch = fetch,
+  pauseMs = CHUNK_PAUSE_MS,
+): Promise<ListEntry[] | null> {
+  const changed: ListEntry[] = [];
+  for (let page = 1; page <= MAX_CHANGE_PAGES; page++) {
+    if (page > 1) {
+      await new Promise((resolve) => setTimeout(resolve, pauseMs));
+    }
+    const variables = { userId, page, perPage: CHANGES_PER_PAGE };
+    const result = (await post<ChangesData>(accessToken, CHANGES_QUERY, variables, fetchFn)).Page;
+    if (!result) {
+      throw new Error('AniList list request failed (no page).');
+    }
+    for (const raw of result.mediaList ?? []) {
+      if ((raw.updatedAt ?? 0) < since) {
+        return changed;
+      }
+      const entry = toEntry(raw);
+      if (entry) {
+        changed.push(entry);
+      }
+    }
+    if (!result.pageInfo?.hasNextPage) {
+      return changed;
+    }
+  }
+  return null;
+}
+
+/** One GraphQL call. Throws UnauthorizedError on 401 or an invalid token, RateLimitedError on 429, Error otherwise. */
+async function post<T>(
+  accessToken: string,
+  query: string,
+  variables: Record<string, unknown>,
+  fetchFn: typeof fetch,
+): Promise<T> {
+  const response = await fetchFn(ANILIST.graphqlUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (response.status === 401) {
+    throw new UnauthorizedError();
+  }
+  if (response.status === 429) {
+    throw new RateLimitedError();
+  }
+  const body = (await response.json().catch(() => ({}))) as {
+    data?: T;
+    errors?: { status?: number; message?: string }[];
+  };
+  if (body.errors?.some((e) => e.status === 401 || /invalid token/i.test(e.message ?? ''))) {
+    throw new UnauthorizedError();
+  }
+  if (body.errors?.some((e) => e.status === 429)) {
+    throw new RateLimitedError();
+  }
+  if (!response.ok || !body.data) {
+    throw new Error(`AniList list request failed (${response.status}).`);
+  }
+  return body.data;
 }
 
 function toEntry(raw: RawEntry): ListEntry | null {

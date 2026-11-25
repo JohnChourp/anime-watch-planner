@@ -12,7 +12,9 @@ export interface CachedList {
   userId: number;
   /** Device time of the last full refresh, in ms (for the 30-day TTL). */
   fetchedAt: number;
-  /** Highest AniList `updatedAt` seen (server time, seconds): where "changes only" (3.2) will stop. */
+  /** Device time of the last full refresh or check for changes, in ms (for "updated …" and the 15-minute gap). */
+  checkedAt: number;
+  /** Highest AniList `updatedAt` seen (server time, seconds): where the check for changes stops. */
   watermark: number;
   entries: ListEntry[];
 }
@@ -35,7 +37,12 @@ export class ListStore {
         Number.isFinite(value.fetchedAt) &&
         Number.isFinite(value.watermark) &&
         Array.isArray(value.entries);
-      return valid ? (value as CachedList) : null;
+      if (!valid) {
+        return null;
+      }
+      // Files saved before task 3.2 have no checkedAt: their last check was the full refresh.
+      const checkedAt = Number.isFinite(value.checkedAt) ? value.checkedAt : value.fetchedAt;
+      return { ...value, checkedAt } as CachedList;
     } catch {
       return null; // No file yet, or a damaged one: fetch again.
     }
