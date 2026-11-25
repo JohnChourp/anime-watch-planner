@@ -171,6 +171,57 @@ describe('ListService', () => {
     expect(list.fetchedAt()).toBe(now - LIST_TTL_MS);
   });
 
+  it('pull-to-refresh on 429 says how long AniList asks to wait, then tries once more', async () => {
+    auth.viewer.set(me);
+    let calls = 0;
+    const seen: (string | null)[] = [];
+    const fn = (async () => {
+      calls++;
+      seen.push(list.message());
+      if (calls === 1) {
+        const reset = String(Math.ceil(Date.now() / 1000) + 1);
+        return new Response('{}', {
+          status: 429,
+          headers: { 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': reset },
+        });
+      }
+      const body = { data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: [entry(1, 50)] }] } } };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as unknown as typeof fetch;
+    list.useFetch(fn);
+    await list.refresh(now);
+    expect(calls).toBe(2);
+    expect(seen[1]).toMatch(/^AniList is busy\. Waiting [12] s…$/);
+    expect(list.message()).toBeNull();
+    expect(list.entries()?.length).toBe(1);
+  });
+
+  it('a refresh on start waiting behind a 429 stays quiet', async () => {
+    store.saved = saved(7, now - LIST_TTL_MS);
+    const reset = String(Math.ceil(Date.now() / 1000) + 1);
+    const seen: (string | null)[] = [];
+    const fn = (async () => {
+      seen.push(list.message());
+      if (seen.length === 1) {
+        return new Response('{}', { status: 429, headers: { 'X-RateLimit-Reset': reset } });
+      }
+      const body = { data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: [] }] } } };
+      return new Response(JSON.stringify(body));
+    }) as unknown as typeof fetch;
+    list.useFetch(fn);
+    await list.sync(7, now); // 429: the gate now waits about 1 s before the next call.
+    await list.sync(7, now);
+    expect(seen).toEqual([null, null]);
+  });
+
+  it('the 30-day refresh on 429 does not try again', async () => {
+    store.saved = saved(7, now - LIST_TTL_MS);
+    const { fn, calls } = listFetch(429);
+    list.useFetch(fn);
+    await list.sync(7, now);
+    expect(calls.length).toBe(1);
+  });
+
   it('a 401 ends the session', async () => {
     auth.viewer.set(me);
     list.useFetch(listFetch(401).fn);
