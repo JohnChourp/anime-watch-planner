@@ -35,9 +35,12 @@ export class HomePage {
     const entries = this.list.entries();
     const fetchedAt = this.list.fetchedAt();
     if (!entries || fetchedAt === null) {
-      return this.list.refreshing() ? 'Loading your list…' : 'Pull down to load your list.';
+      if (this.list.refreshing()) {
+        return 'Loading your list…';
+      }
+      return this.list.message() ? null : 'Pull down to load your list.';
     }
-    return `${entries.length} anime · updated ${updatedLabel(fetchedAt, Date.now())}`;
+    return `${entries.length} anime · updated ${updatedLabel(fetchedAt, Math.max(this.list.now(), fetchedAt))}`;
   });
 
   protected async refresh(event: RefresherCustomEvent): Promise<void> {

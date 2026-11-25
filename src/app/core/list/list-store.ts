@@ -29,7 +29,13 @@ export class ListStore {
     try {
       const file = await Filesystem.readFile({ path: FILE, directory: DIR, encoding: Encoding.UTF8 });
       const value = JSON.parse(String(file.data)) as Partial<CachedList>;
-      return value.version === CACHE_VERSION && Array.isArray(value.entries) ? (value as CachedList) : null;
+      const valid =
+        value.version === CACHE_VERSION &&
+        Number.isFinite(value.userId) &&
+        Number.isFinite(value.fetchedAt) &&
+        Number.isFinite(value.watermark) &&
+        Array.isArray(value.entries);
+      return valid ? (value as CachedList) : null;
     } catch {
       return null; // No file yet, or a damaged one: fetch again.
     }
@@ -47,8 +53,12 @@ export class ListStore {
     await Filesystem.rename({ from: TEMP, to: FILE, directory: DIR, toDirectory: DIR });
   }
 
+  /** Deletes only the files that are there, so a signed-out start does not log "file does not exist" errors. */
   async delete(): Promise<void> {
-    for (const path of [FILE, TEMP]) {
+    const names = await Filesystem.readdir({ path: '', directory: DIR })
+      .then((result) => result.files.map((f) => f.name))
+      .catch(() => [FILE, TEMP]); // Cannot list the folder: try both, as forgetting the list matters more.
+    for (const path of [FILE, TEMP].filter((name) => names.includes(name))) {
       await Filesystem.deleteFile({ path, directory: DIR }).catch(() => undefined);
     }
   }

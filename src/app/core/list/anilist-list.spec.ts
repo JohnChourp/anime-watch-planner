@@ -69,7 +69,7 @@ describe('fetchList', () => {
       { status: 200, body: page([raw(1), raw(2)], true) },
       { status: 200, body: page([raw(2), raw(3)]) },
     ]);
-    const entries = await fetchList('tok', 7, fn);
+    const entries = await fetchList('tok', 7, fn, 0);
     expect(calls.map((c) => c.chunk)).toEqual([1, 2]);
     expect(entries.map((e) => e.id)).toEqual([1, 2, 3]);
   });

@@ -196,6 +196,34 @@ describe('ListService', () => {
     expect(list.entries()).toBeNull();
   });
 
+  it('on resume, fetches a list that has turned 30 days old while the app was in memory', async () => {
+    const now = Date.now(); // The status effect syncs with the real clock.
+    store.saved = saved(7, now);
+    auth.viewer.set(me);
+    auth.status.set('signedIn');
+    const { fn, calls } = listFetch(200);
+    list.useFetch(fn);
+    TestBed.tick();
+    await vi.waitFor(() => expect(list.entries()).toEqual([]));
+    expect(calls.length).toBe(0);
+    list.resume(now + LIST_TTL_MS);
+    await vi.waitFor(() => expect(calls.length).toBe(1));
+    expect(list.now()).toBe(now + LIST_TTL_MS);
+  });
+
+  it('a pull-to-refresh before the first load is not undone by the next sync', async () => {
+    auth.viewer.set(me);
+    store.write = async () => {
+      throw new Error('disk full');
+    };
+    const { fn, calls } = listFetch(200);
+    list.useFetch(fn);
+    await list.refresh(now);
+    await list.sync(7, now);
+    expect(calls.length).toBe(1);
+    expect(list.entries()?.length).toBe(2);
+  });
+
   it('reacts to the sign-in status: signed in loads, signed out clears', async () => {
     const { fn } = listFetch(200);
     list.useFetch(fn);

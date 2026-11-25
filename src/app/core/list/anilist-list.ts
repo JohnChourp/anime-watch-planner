@@ -39,6 +39,8 @@ export class RateLimitedError extends Error {
 const PER_CHUNK = 500;
 /** A guard against a server that never says "no next chunk": 20 × 500 = 10,000 entries. */
 const MAX_CHUNKS = 20;
+/** A pause between chunks, so a big list does not trip AniList's burst limiter (full limit handling: 3.3). */
+const CHUNK_PAUSE_MS = 1500;
 
 const QUERY = `query ($userId: Int, $chunk: Int, $perChunk: Int) {
   MediaListCollection(userId: $userId, type: ANIME, chunk: $chunk, perChunk: $perChunk, forceSingleCompletedList: true) {
@@ -93,9 +95,13 @@ export async function fetchList(
   accessToken: string,
   userId: number,
   fetchFn: typeof fetch = fetch,
+  pauseMs = CHUNK_PAUSE_MS,
 ): Promise<ListEntry[]> {
   const byId = new Map<number, ListEntry>();
   for (let chunk = 1; chunk <= MAX_CHUNKS; chunk++) {
+    if (chunk > 1) {
+      await new Promise((resolve) => setTimeout(resolve, pauseMs));
+    }
     const response = await fetchFn(ANILIST.graphqlUrl, {
       method: 'POST',
       headers: {

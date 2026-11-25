@@ -1,4 +1,5 @@
 import { Injectable, effect, inject, signal, untracked } from '@angular/core';
+import { App } from '@capacitor/app';
 
 import { UnauthorizedError } from '../auth/anilist-viewer';
 import { AuthService } from '../auth/auth.service';
@@ -30,6 +31,8 @@ export class ListService {
   readonly refreshing = signal(false);
   /** A short, plain message when the list could not be fetched. */
   readonly message = signal<string | null>(null);
+  /** Device time of the last start or resume, so "updated today" and the 30-day check follow the calendar. */
+  readonly now = signal(Date.now());
 
   constructor() {
     effect(() => {
@@ -43,6 +46,16 @@ export class ListService {
         }
       });
     });
+    // An app kept in memory for weeks is resumed, not started: check the 30-day age again then.
+    void App.addListener('resume', () => this.resume()).catch(() => undefined);
+  }
+
+  /** Back from the background: refresh the clock, and the list if it is now 30 days old. */
+  resume(now = Date.now()): void {
+    this.now.set(now);
+    if (this.auth.status() === 'signedIn') {
+      void this.sync(this.auth.viewer()?.id ?? null, now);
+    }
   }
 
   /** For tests only. */
@@ -135,6 +148,7 @@ export class ListService {
         watermark: entries.reduce((max, e) => Math.max(max, e.updatedAt), 0),
         entries,
       };
+      this.loaded = true;
       this.show(list);
       await this.store.write(list).catch(() => {
         // Still shown; the next start fetches it again.

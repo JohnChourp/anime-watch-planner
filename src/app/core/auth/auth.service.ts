@@ -69,6 +69,7 @@ export class AuthService {
   accessToken(now = Date.now()): string | null {
     if (this.token && this.token.expiresAt <= now) {
       void this.expire();
+      return null;
     }
     return this.token?.accessToken ?? null;
   }
