@@ -15,7 +15,7 @@ vi.mock('@capacitor/filesystem', () => ({
 }));
 
 const fs = vi.mocked(Filesystem);
-const good: CachedList = { version: CACHE_VERSION, userId: 7, fetchedAt: 1, watermark: 2, entries: [] };
+const good: CachedList = { version: CACHE_VERSION, userId: 7, fetchedAt: 1, checkedAt: 3, watermark: 2, entries: [] };
 
 describe('ListStore', () => {
   const store = new ListStore();
@@ -25,6 +25,12 @@ describe('ListStore', () => {
   it('reads a saved list', async () => {
     fs.readFile.mockResolvedValue({ data: JSON.stringify(good) });
     expect(await store.read()).toEqual(good);
+  });
+
+  it('reads a file saved before checkedAt existed as last checked at its full refresh', async () => {
+    const { checkedAt: _, ...old } = good;
+    fs.readFile.mockResolvedValue({ data: JSON.stringify(old) });
+    expect(await store.read()).toEqual({ ...good, checkedAt: 1 });
   });
 
   it('ignores a missing, damaged, older or incomplete file', async () => {
