@@ -16,9 +16,16 @@
     <ion-spinner name="crescent" aria-label="Loading"></ion-spinner>
   </section>
   } @else if (auth.status() === 'signedIn') {
+  <ion-refresher slot="fixed" (ionRefresh)="refresh($event)">
+    <ion-refresher-content></ion-refresher-content>
+  </ion-refresher>
   <section class="state">
     <h2>{{ signedInTitle() }}</h2>
-    <p>Your list comes next.</p>
+    @if (listSummary(); as summary) {
+    <p class="summary" role="status">{{ summary }}</p>
+    } @if (list.message(); as message) {
+    <p class="message" role="alert">{{ message }}</p>
+    }
     <ion-button class="action" fill="outline" (click)="auth.signOut()">Sign out</ion-button>
   </section>
   } @else {

@@ -163,7 +163,7 @@ describe('AuthService', () => {
   it('signs out when the token expires while the app is open', async () => {
     platform.saved = { accessToken: 't', expiresAt: now + 1000 };
     await auth.start(now);
-    auth.accessToken(now + 1000);
+    expect(auth.accessToken(now + 1000)).toBeNull();
     await Promise.resolve();
     await Promise.resolve();
     expect(auth.status()).toBe('signedOut');

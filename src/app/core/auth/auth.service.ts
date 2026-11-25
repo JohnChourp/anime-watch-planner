@@ -69,6 +69,7 @@ export class AuthService {
   accessToken(now = Date.now()): string | null {
     if (this.token && this.token.expiresAt <= now) {
       void this.expire();
+      return null;
     }
     return this.token?.accessToken ?? null;
   }
@@ -133,7 +134,7 @@ export class AuthService {
     await this.loadViewer();
   }
 
-  /** Signs out on this device: forgets the token. (The list cache is cleared here too once it exists, 3.1.) */
+  /** Signs out on this device: forgets the token. ListService sees the status change and deletes the saved list. */
   async signOut(): Promise<void> {
     try {
       await this.platform.deleteToken();
@@ -151,7 +152,8 @@ export class AuthService {
     this.message.set('Your AniList session has ended. Please sign in again.');
   }
 
-  private async loadViewer(): Promise<void> {
+  /** Asks AniList who is signed in; the list refresh calls it again when the first try was offline. */
+  async loadViewer(): Promise<void> {
     const token = this.token;
     if (!token) {
       return;
