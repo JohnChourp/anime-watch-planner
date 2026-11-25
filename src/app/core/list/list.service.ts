@@ -83,7 +83,7 @@ export class ListService {
         }
         return;
       }
-      await this.fetchAndSave(viewer.id, now, generation);
+      await this.fetchAndSave(viewer.id, now, generation, true);
     });
   }
 
@@ -141,8 +141,11 @@ export class ListService {
     await next;
   }
 
-  /** `generation` is taken when the job was asked for, so a sign-out in between cancels it. */
-  private async fetchAndSave(userId: number, now: number, generation: number): Promise<void> {
+  /**
+   * `generation` is taken when the job was asked for, so a sign-out in between cancels it.
+   * `userAsked` (pull-to-refresh): on 429, say how long AniList asks to wait, then try once more.
+   */
+  private async fetchAndSave(userId: number, now: number, generation: number, userAsked = false): Promise<void> {
     const token = this.auth.accessToken(now);
     if (!token || generation !== this.generation) {
       return;
@@ -150,7 +153,12 @@ export class ListService {
     this.refreshing.set(true);
     this.message.set(null);
     try {
-      const entries = await fetchList(token, userId, this.fetchFn);
+      const onWait = (seconds: number) => {
+        if (generation === this.generation) {
+          this.message.set(`AniList is busy. Trying again in ${seconds} s…`);
+        }
+      };
+      const entries = await fetchList(token, userId, this.fetchFn, undefined, { retry: userAsked, onWait });
       if (generation !== this.generation) {
         return;
       }
@@ -163,6 +171,7 @@ export class ListService {
         entries,
       };
       this.loaded = true;
+      this.message.set(null);
       await this.save(list);
     } catch (error) {
       await this.fail(error, generation);

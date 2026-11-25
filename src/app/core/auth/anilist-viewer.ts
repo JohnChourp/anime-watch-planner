@@ -1,3 +1,5 @@
+import { anilistGate } from '../anilist/anilist-gate';
+
 import { ANILIST } from './anilist.config';
 
 export interface Viewer {
@@ -13,7 +15,7 @@ export class UnauthorizedError extends Error {
 
 /** One GraphQL call: who owns this token. Throws UnauthorizedError on 401 or an invalid token. */
 export async function fetchViewer(accessToken: string, fetchFn: typeof fetch = fetch): Promise<Viewer> {
-  const response = await fetchFn(ANILIST.graphqlUrl, {
+  const response = await anilistGate.send(fetchFn, ANILIST.graphqlUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -25,7 +27,7 @@ export async function fetchViewer(accessToken: string, fetchFn: typeof fetch = f
   if (response.status === 401) {
     throw new UnauthorizedError();
   }
-  const body = (await response.json()) as {
+  const body = (await response.json().catch(() => ({}))) as {
     data?: { Viewer?: Viewer | null };
     errors?: { status?: number; message?: string }[];
   };

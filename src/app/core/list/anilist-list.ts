@@ -1,3 +1,4 @@
+import { anilistGate, type GateOptions } from '../anilist/anilist-gate';
 import { UnauthorizedError } from '../auth/anilist-viewer';
 import { ANILIST } from '../auth/anilist.config';
 
@@ -28,7 +29,7 @@ export interface ListEntry {
   };
 }
 
-/** AniList answered 429: too many requests. No retry here; task 3.3 adds waiting and retrying. */
+/** AniList answered 429: too many requests, after the gate's one retry when the caller asked for it. */
 export class RateLimitedError extends Error {
   constructor() {
     super('AniList is getting too many requests.');
@@ -39,7 +40,7 @@ export class RateLimitedError extends Error {
 const PER_CHUNK = 500;
 /** A guard against a server that never says "no next chunk": 20 × 500 = 10,000 entries. */
 const MAX_CHUNKS = 20;
-/** A pause between chunks, so a big list does not trip AniList's burst limiter (full limit handling: 3.3). */
+/** A pause between chunks, so a big list does not trip AniList's burst limiter. */
 const CHUNK_PAUSE_MS = 1500;
 
 /** The entry fields both queries ask for (decided 2026-11-25: list fields only). */
@@ -109,6 +110,7 @@ export async function fetchList(
   userId: number,
   fetchFn: typeof fetch = fetch,
   pauseMs = CHUNK_PAUSE_MS,
+  options: GateOptions = {},
 ): Promise<ListEntry[]> {
   const byId = new Map<number, ListEntry>();
   for (let chunk = 1; chunk <= MAX_CHUNKS; chunk++) {
@@ -116,7 +118,8 @@ export async function fetchList(
       await new Promise((resolve) => setTimeout(resolve, pauseMs));
     }
     const variables = { userId, chunk, perChunk: PER_CHUNK };
-    const collection = (await post<CollectionData>(accessToken, QUERY, variables, fetchFn)).MediaListCollection;
+    const collection = (await post<CollectionData>(accessToken, QUERY, variables, fetchFn, options))
+      .MediaListCollection;
     if (!collection) {
       throw new Error('AniList list request failed (no list).');
     }
@@ -176,14 +179,15 @@ export async function fetchChanges(
   return null;
 }
 
-/** One GraphQL call. Throws UnauthorizedError on 401 or an invalid token, RateLimitedError on 429, Error otherwise. */
+/** One GraphQL call, through the shared gate. Throws UnauthorizedError on 401 or an invalid token, RateLimitedError on 429, Error otherwise. */
 async function post<T>(
   accessToken: string,
   query: string,
   variables: Record<string, unknown>,
   fetchFn: typeof fetch,
+  options: GateOptions = {},
 ): Promise<T> {
-  const response = await fetchFn(ANILIST.graphqlUrl, {
+  const init: RequestInit = {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -191,7 +195,8 @@ async function post<T>(
       Authorization: `Bearer ${accessToken}`,
     },
     body: JSON.stringify({ query, variables }),
-  });
+  };
+  const response = await anilistGate.send(fetchFn, ANILIST.graphqlUrl, init, options);
   if (response.status === 401) {
     throw new UnauthorizedError();
   }
