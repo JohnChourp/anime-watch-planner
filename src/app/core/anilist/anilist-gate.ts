@@ -16,8 +16,9 @@ export interface GateOptions {
 /**
  * Every AniList call goes through here (task 3.3, decided 2026-11-25): one call at a time, a wait for the reset when
  * the minute's calls are almost used up, and on 429 at most one more try after the wait.
- * The WebView can read X-RateLimit-Remaining and X-RateLimit-Reset (seconds since 1970), but not Retry-After,
- * which AniList does not expose to browsers; without a reset time the wait is 60 s.
+ * On iOS and Android fetch runs natively (CapacitorHttp), so the 429 and Retry-After arrive as sent. In a browser
+ * AniList's 429 for a signed-in call has no CORS headers and shows up as a network error instead.
+ * The wait is Retry-After, else X-RateLimit-Reset (seconds since 1970), else 60 s.
  */
 export class AniListGate {
   private queue: Promise<unknown> = Promise.resolve();
@@ -72,8 +73,11 @@ export class AniListGate {
     if (response.status !== 429 && !(Number.isFinite(remaining) && remaining <= RESERVE)) {
       return;
     }
-    const reset = Number(response.headers.get('X-RateLimit-Reset') || NaN) * 1000;
     const now = this.clock();
+    const retryAfter = Number(response.headers.get('Retry-After') || NaN) * 1000;
+    const reset = Number.isFinite(retryAfter)
+      ? now + retryAfter
+      : Number(response.headers.get('X-RateLimit-Reset') || NaN) * 1000;
     // The device clock may differ from AniList's: keep the wait between 1 s and 60 s.
     const wait = Number.isFinite(reset) && reset > 0 ? Math.min(Math.max(reset - now, 1000), MAX_WAIT_MS) : MAX_WAIT_MS;
     this.blockedUntil = Math.max(this.blockedUntil, now + wait);

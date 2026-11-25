@@ -1,6 +1,6 @@
 import { AniListGate } from './anilist-gate';
 
-function setup(responses: { status: number; remaining?: number; reset?: number }[]) {
+function setup(responses: { status: number; remaining?: number; reset?: number; retryAfter?: number }[]) {
   let now = 1_000_000;
   const slept: number[] = [];
   const order: string[] = [];
@@ -17,6 +17,7 @@ function setup(responses: { status: number; remaining?: number; reset?: number }
     const headers: Record<string, string> = {};
     if (next.remaining !== undefined) headers['X-RateLimit-Remaining'] = String(next.remaining);
     if (next.reset !== undefined) headers['X-RateLimit-Reset'] = String(next.reset);
+    if (next.retryAfter !== undefined) headers['Retry-After'] = String(next.retryAfter);
     return new Response('{}', { status: next.status, headers });
   }) as unknown as typeof fetch;
   return { gate, fn, slept, order, at: () => now };
@@ -76,6 +77,13 @@ describe('AniListGate', () => {
     await gate.send(empty, 'a', {});
     await gate.send(empty, 'b', {});
     expect(slept).toEqual([]);
+  });
+
+  it('prefers Retry-After over X-RateLimit-Reset', async () => {
+    const { gate, fn, slept } = setup([{ status: 429, retryAfter: 42, reset: 1_052 }, { status: 200 }]);
+    await gate.send(fn, 'a', {});
+    await gate.send(fn, 'b', {});
+    expect(slept).toEqual([42_000]);
   });
 
   it('waits 60 s when AniList gives no reset time, and never more than 60 s or less than 1 s', async () => {
