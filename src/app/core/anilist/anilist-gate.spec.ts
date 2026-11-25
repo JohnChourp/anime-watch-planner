@@ -60,6 +60,24 @@ describe('AniListGate', () => {
     expect(slept).toEqual([52_000]);
   });
 
+  it('says how long before a call that waits behind an earlier 429', async () => {
+    const { gate, fn, slept } = setup([{ status: 429, remaining: 0, reset: 1_052 }, { status: 200 }]);
+    await gate.send(fn, 'a', {});
+    const waits: number[] = [];
+    await gate.send(fn, 'b', {}, { onWait: (s) => waits.push(s) });
+    expect(waits).toEqual([52]);
+    expect(slept).toEqual([52_000]);
+  });
+
+  it('reads an empty X-RateLimit-Remaining as no value', async () => {
+    const { gate, slept } = setup([]);
+    const empty = (async () =>
+      new Response('{}', { headers: { 'X-RateLimit-Remaining': '' } })) as unknown as typeof fetch;
+    await gate.send(empty, 'a', {});
+    await gate.send(empty, 'b', {});
+    expect(slept).toEqual([]);
+  });
+
   it('waits 60 s when AniList gives no reset time, and never more than 60 s or less than 1 s', async () => {
     const none = setup([{ status: 429 }, { status: 200 }]);
     await none.gate.send(none.fn, 'a', {});

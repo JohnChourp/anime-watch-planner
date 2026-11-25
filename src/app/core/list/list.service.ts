@@ -130,7 +130,8 @@ export class ListService {
     this.loaded = false;
     this.show(null);
     this.message.set(null);
-    // Queued, so a refresh that is saving right now cannot write the file back after it is deleted.
+    // Queued, so a refresh that is saving right now cannot write the file back after it is deleted. A refresh
+    // waiting for AniList's limit delays the delete by up to 60 s; the list is off the screen at once.
     await this.run(() => this.store.delete());
   }
 
@@ -143,7 +144,7 @@ export class ListService {
 
   /**
    * `generation` is taken when the job was asked for, so a sign-out in between cancels it.
-   * `userAsked` (pull-to-refresh): on 429, say how long AniList asks to wait, then try once more.
+   * `userAsked` (pull-to-refresh): say how long AniList asks to wait, and on 429 try once more.
    */
   private async fetchAndSave(userId: number, now: number, generation: number, userAsked = false): Promise<void> {
     const token = this.auth.accessToken(now);
@@ -153,12 +154,14 @@ export class ListService {
     this.refreshing.set(true);
     this.message.set(null);
     try {
+      // Only what the user asked for says it is waiting; a refresh on start or resume stays quiet.
       const onWait = (seconds: number) => {
         if (generation === this.generation) {
-          this.message.set(`AniList is busy. Trying again in ${seconds} s…`);
+          this.message.set(`AniList is busy. Waiting ${seconds} s…`);
         }
       };
-      const entries = await fetchList(token, userId, this.fetchFn, undefined, { retry: userAsked, onWait });
+      const options = userAsked ? { retry: true, onWait } : {};
+      const entries = await fetchList(token, userId, this.fetchFn, undefined, options);
       if (generation !== this.generation) {
         return;
       }
