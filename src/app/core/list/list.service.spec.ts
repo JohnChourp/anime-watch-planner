@@ -44,14 +44,14 @@ class FakeStore {
   }
 }
 
-const entry = (id: number, updatedAt: number) => ({
+const entry = (id: number, updatedAt: number, mediaId = id) => ({
   id,
   status: 'CURRENT',
   progress: 1,
   repeat: 0,
   updatedAt,
   score: 0,
-  media: { id, title: { romaji: 'x', english: null }, coverImage: null },
+  media: { id: mediaId, title: { romaji: 'x', english: null }, coverImage: null },
 });
 
 /** Answers the full-list query with `entries`, and the changes query with `changes` (one page each). */
@@ -278,14 +278,54 @@ describe('ListService', () => {
     expect(store.saved).toMatchObject({ fetchedAt: now, checkedAt: now, watermark: 70 });
   });
 
-  it('a failed check keeps the saved copy and tries again on the next start', async () => {
+  it('an anime removed and added again on the site replaces its old entry', async () => {
     store.saved = saved(7, now - 1000, now - CHANGES_INTERVAL_MS);
-    const { fn } = listFetch(500);
+    const { fn } = listFetch(200, [], [[entry(30, 60, 2)]]);
     list.useFetch(fn);
     await list.sync(7, now);
-    expect(list.message()).toBe('Could not update your list. Showing the saved copy.');
-    expect(list.entries()?.length).toBe(2);
+    expect(list.entries()?.map((e) => [e.id, e.media.id])).toEqual([
+      [1, 1],
+      [30, 2],
+    ]);
+  });
+
+  it('a failed check stays quiet, keeps the saved copy and tries again on the next start', async () => {
+    store.saved = saved(7, now - 1000, now - CHANGES_INTERVAL_MS);
+    for (const status of [500, 429]) {
+      const { fn, calls } = listFetch(status);
+      list.useFetch(fn);
+      await list.sync(7, now);
+      expect(calls).toEqual(['changes']);
+      expect(list.message()).toBeNull();
+      expect(list.entries()?.length).toBe(2);
+      expect(list.checkedAt()).toBe(now - CHANGES_INTERVAL_MS);
+    }
     expect(store.writes).toBe(0);
+  });
+
+  it('a 401 during a check ends the session', async () => {
+    store.saved = saved(7, now - 1000, now - CHANGES_INTERVAL_MS);
+    list.useFetch(listFetch(401).fn);
+    await list.sync(7, now);
+    expect(auth.expired).toBe(1);
+  });
+
+  it('sign-out during a check does not save the old list back', async () => {
+    store.saved = saved(7, now - 1000, now - CHANGES_INTERVAL_MS);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow = (async (...args: Parameters<typeof fetch>) => {
+      await gate;
+      return listFetch(200, [], [[entry(3, 60)]]).fn(...args);
+    }) as typeof fetch;
+    list.useFetch(slow);
+    const running = list.sync(7, now);
+    await vi.waitFor(() => expect(list.refreshing()).toBe(true));
+    const cleared = list.clear();
+    release();
+    await Promise.all([running, cleared]);
+    expect(store.saved).toBeNull();
+    expect(list.entries()).toBeNull();
   });
 
   it('reacts to the sign-in status: signed in loads, signed out clears', async () => {

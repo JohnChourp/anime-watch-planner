@@ -29,7 +29,7 @@ export class ListService {
   private generation = 0;
 
   readonly entries = signal<ListEntry[] | null>(null);
-  /** When the list was last fetched in full (device time, ms), or null. */
+  /** When the list was last fetched in full (device time, ms), or null: the 30-day clock, not "updated …". */
   readonly fetchedAt = signal<number | null>(null);
   /** When the list was last fetched in full or checked for changes (device time, ms), or null. */
   readonly checkedAt = signal<number | null>(null);
@@ -171,7 +171,10 @@ export class ListService {
     }
   }
 
-  /** Asks AniList only for the entries changed since the last one seen, and puts them into the saved list. */
+  /**
+   * Asks AniList only for the entries changed since the last one seen, and puts them into the saved list.
+   * The user did not ask for it, so a failure stays quiet (the next start or resume tries again); 401 still signs out.
+   */
   private async checkChanges(userId: number, now: number, generation: number): Promise<void> {
     const cache = this.cache;
     const token = this.auth.accessToken(now);
@@ -179,23 +182,26 @@ export class ListService {
       return;
     }
     this.refreshing.set(true);
-    this.message.set(null);
     try {
       const changed = await fetchChanges(token, userId, cache.watermark, this.fetchFn);
       if (generation !== this.generation || this.cache !== cache) {
         return; // Signed out meanwhile.
       }
       if (changed !== null) {
-        const byId = new Map(cache.entries.map((e) => [e.id, e]));
+        // By media: an anime removed and added again on the site comes back as a new entry id.
+        const byMedia = new Map(cache.entries.map((e) => [e.media.id, e]));
         for (const entry of changed) {
-          byId.set(entry.id, entry);
+          byMedia.set(entry.media.id, entry);
         }
         const watermark = highest(changed, cache.watermark);
-        await this.save({ ...cache, checkedAt: now, watermark, entries: [...byId.values()] });
+        this.message.set(null);
+        await this.save({ ...cache, checkedAt: now, watermark, entries: [...byMedia.values()] });
         return;
       }
     } catch (error) {
-      await this.fail(error, generation);
+      if (error instanceof UnauthorizedError && generation === this.generation) {
+        await this.auth.expire();
+      }
       return;
     } finally {
       this.refreshing.set(false);
