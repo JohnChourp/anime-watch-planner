@@ -1,6 +1,7 @@
 import { signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 
+import { anilistGate } from '../anilist/anilist-gate';
 import type { Viewer } from '../auth/anilist-viewer';
 import type { AuthStatus } from '../auth/auth.service';
 import { AuthService } from '../auth/auth.service';
@@ -426,6 +427,58 @@ describe('ListService', () => {
       expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
     });
 
+    it('cancels a quick return to the saved status without sending any mutation', async () => {
+      const send = vi.fn(listFetch(500).fn);
+      list.useFetch(send);
+      const first = list.changeStatus(1, 'PAUSED');
+      await list.changeStatus(1, 'CURRENT');
+      await first;
+      expect(send).not.toHaveBeenCalled();
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(store.writes).toBe(0);
+    });
+
+    it('cancels even after debounce if the shared gate has not dispatched the change', async () => {
+      await anilistGate.send(async () => new Response(null, { status: 429, headers: { 'Retry-After': '1' } }), '/', {});
+      const send = vi.fn(listFetch(500).fn);
+      list.useFetch(send);
+      const first = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(list.statusEdits().get(1)?.message).toContain('Waiting'));
+      await Promise.all([first, list.changeStatus(1, 'CURRENT')]);
+      expect(send).not.toHaveBeenCalled();
+      expect(list.statusEdits().has(1)).toBe(false);
+    });
+
+    it.each(['confirmed', 'confirmed after undo', 'lost'])(
+      'sends the undo when the first request was dispatched and its reply is %s',
+      async (outcome) => {
+        let reply!: (response: Response) => void;
+        const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const { status } = JSON.parse(String(init?.body)).variables;
+          if (status === 'PAUSED') return new Promise<Response>((resolve) => (reply = resolve));
+          return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 62), status } } });
+        });
+        list.useFetch(send);
+        const first = list.changeStatus(1, 'PAUSED');
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        const intermediate = list.changeStatus(1, 'DROPPED');
+        const earlyUndo = outcome === 'confirmed after undo' ? list.changeStatus(1, 'CURRENT') : undefined;
+        reply(
+          outcome !== 'lost'
+            ? Response.json({ data: { SaveMediaListEntry: { ...entry(1, 61), status: 'PAUSED' } } })
+            : Response.json({}, { status: 503 }),
+        );
+        await first;
+        await Promise.all([intermediate, earlyUndo ?? list.changeStatus(1, 'CURRENT')]);
+        expect(send.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).variables.status)).toEqual([
+          'PAUSED',
+          'CURRENT',
+        ]);
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+      },
+    );
+
     it('clears a pending selection on failure, retains the confirmed row and lets the user retry', async () => {
       const original = store.saved;
       list.useFetch(async () => Response.json({}, { status: 500 }));
@@ -490,6 +543,44 @@ describe('ListService', () => {
       await list.changeStatus(1, 'PAUSED');
       expect(list.entries()?.[0].status).toBe('PAUSED');
       expect(list.statusEdits().get(1)?.message).toContain('This device could not store');
+    });
+
+    it.each([1, 3])('clears only the settled error for the anime returned on resume (entry %i)', async (returnedId) => {
+      list.useFetch(async () => {
+        throw new Error('Reply lost');
+      });
+      await Promise.all([list.changeStatus(1, 'PAUSED'), list.changeStatus(2, 'DROPPED')]);
+      expect(list.statusEdits().get(1)?.message).toContain('Could not confirm');
+      const updated = { ...entry(returnedId, 70, 1), status: 'PAUSED' };
+      const delta = listFetch(200, [], [[updated]]);
+      list.useFetch(delta.fn);
+      list.resume(store.saved!.checkedAt + CHANGES_INTERVAL_MS);
+      await vi.waitFor(() => expect(list.entries()?.find((item) => item.id === returnedId)?.status).toBe('PAUSED'));
+      expect(delta.calls).toEqual(['changes']);
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(list.statusEdits().get(2)?.message).toContain('Could not confirm');
+    });
+
+    it('keeps a newer pending edit when a delta is received for the same entry', async () => {
+      let reply!: (response: Response) => void;
+      const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(init?.body).includes('UPDATED_TIME_DESC'))
+          return new Promise<Response>((resolve) => (reply = resolve));
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 80), status: 'DROPPED' } } });
+      });
+      list.useFetch(send);
+      const sync = list.sync(me.id, store.saved!.checkedAt + CHANGES_INTERVAL_MS);
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const pending = list.changeStatus(1, 'DROPPED');
+      reply(
+        Response.json({
+          data: { Page: { pageInfo: { hasNextPage: false }, mediaList: [{ ...entry(1, 70), status: 'PAUSED' }] } },
+        }),
+      );
+      await sync;
+      expect(list.statusEdits().get(1)?.pending).toBe('DROPPED');
+      await pending;
+      expect(store.saved?.entries[0].status).toBe('DROPPED');
     });
 
     it('keeps a later choice on the same title when the first confirmation arrives', async () => {

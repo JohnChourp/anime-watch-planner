@@ -31,6 +31,20 @@ export class HomePage {
   protected readonly signingIn = computed(() => this.auth.status() === 'signingIn');
 
   protected readonly list = inject(ListService);
+  protected readonly titleLabels = computed(() => pickerLabels(this.list.entries() ?? []));
+  protected readonly editProblems = computed(() => {
+    const problems = [];
+    for (const [id, edit] of this.list.statusEdits()) {
+      if (edit.problemMediaId !== undefined) {
+        problems.push({
+          id,
+          title: this.titleLabels().get(id) ?? `Anime #${edit.problemMediaId}`,
+          message: edit.message,
+        });
+      }
+    }
+    return problems;
+  });
   protected readonly statuses = [
     { value: 'CURRENT', label: 'Watching' },
     { value: 'PLANNING', label: 'Planning' },
@@ -67,6 +81,42 @@ export class HomePage {
       await event.target.complete();
     }
   }
+}
+
+/** Keep familiar names for unique titles. Use the year and format for namesakes, then the media ID if needed. */
+function pickerLabels(entries: ListEntry[]): Map<number, string> {
+  const names = entries.map(({ media }) => media.title.english || media.title.romaji || `Anime #${media.id}`);
+  const namesakes = duplicates(names);
+  const qualified = entries.map(({ media }, i) => {
+    const name = names[i];
+    if (!namesakes.has(name)) return name;
+    const format = media.format === 'MOVIE' ? 'Movie' : media.format?.replaceAll('_', ' ');
+    const details = [media.seasonYear, format].filter(Boolean).join(', ');
+    return details ? `${name} (${details})` : name;
+  });
+  const ambiguous = duplicates(qualified);
+  const used = new Set(names.filter((name) => !namesakes.has(name)));
+  return new Map(
+    entries.map(({ id, media }, i) => {
+      let label = qualified[i];
+      if (namesakes.has(names[i])) {
+        if (ambiguous.has(label) || label === names[i]) label += ` #${media.id}`;
+        while (used.has(label)) label += ` #${media.id}`;
+        used.add(label);
+      }
+      return [id, label];
+    }),
+  );
+}
+
+function duplicates(labels: string[]): Set<string> {
+  const seen = new Set<string>();
+  const repeated = new Set<string>();
+  for (const label of labels) {
+    if (seen.has(label)) repeated.add(label);
+    seen.add(label);
+  }
+  return repeated;
 }
 
 /** "today", "yesterday" or "N days ago", by the calendar on this device. */

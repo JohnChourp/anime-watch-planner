@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 
-test('changes only the selected existing anime and shows a change from AniList after refresh', async ({ page }) => {
+test.beforeEach(async ({ page }) => {
   // Restore the session through the web storage adapter in this isolated browser context.
   await page.addInitScript(() =>
     localStorage.setItem(
@@ -11,21 +11,24 @@ test('changes only the selected existing anime and shows a change from AniList a
       }),
     ),
   );
+});
+
+const entry = (id: number, title: string, state: string) => ({
+  id,
+  status: state,
+  progress: 2,
+  score: 0,
+  repeat: 0,
+  updatedAt: 100,
+  startedAt: null,
+  completedAt: null,
+  media: { id: id + 100, title: { romaji: title, english: null }, coverImage: null },
+});
+test('changes only the selected existing anime and shows a change from AniList after refresh', async ({ page }) => {
   let status = 'PLANNING';
   let failNext = false;
   let writes = 0;
   let fullReads = 0;
-  const entry = (id: number, title: string, state: string) => ({
-    id,
-    status: state,
-    progress: 2,
-    score: 0,
-    repeat: 0,
-    updatedAt: 100,
-    startedAt: null,
-    completedAt: null,
-    media: { id: id + 100, title: { romaji: title, english: null }, coverImage: null },
-  });
   await page.route('https://graphql.anilist.co/**', async (route) => {
     const { query, variables } = route.request().postDataJSON();
     if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
@@ -68,4 +71,107 @@ test('changes only the selected existing anime and shows a change from AniList a
   await page.getByLabel('Anime in your list').selectOption({ label: 'First title' });
   await expect(statusButton('Completed')).toHaveAttribute('aria-pressed', 'true');
   expect({ writes, fullReads }).toEqual({ writes: 2, fullReads: 2 });
+});
+
+test('distinguishes namesakes and keeps a delayed failure attached to its anime after switching titles', async ({
+  page,
+}) => {
+  const rows = [
+    [11, 1999, 'TV'],
+    [22, 2020, 'MOVIE'],
+    [33, 2020, 'MOVIE'],
+    [44, null, null],
+  ] as const;
+  const entries = rows.map(([id, year, format]) => {
+    const row = entry(id, 'Twin', 'CURRENT');
+    return {
+      ...row,
+      media: {
+        ...row.media,
+        title: { english: id === 11 ? 'Twin' : null, romaji: id === 11 ? 'Other name' : 'Twin' },
+        seasonYear: year,
+        format,
+      },
+    };
+  });
+  let release!: () => void;
+  const delayed = new Promise<void>((resolve) => (release = resolve));
+  const writes: number[] = [];
+  await page.route('https://graphql.anilist.co/**', async (route) => {
+    const { query, variables } = route.request().postDataJSON();
+    if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+    if (query.includes('MediaListCollection')) {
+      return route.fulfill({
+        json: { data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries }] } } },
+      });
+    }
+    expect(query).toContain('SaveMediaListEntry');
+    writes.push(variables.id);
+    await delayed;
+    return route.fulfill({ status: 503, json: {} });
+  });
+  await page.goto('/');
+  const picker = page.getByLabel('Anime in your list');
+  const labels = [
+    'Choose a title',
+    'Twin (1999, TV)',
+    'Twin (2020, Movie) #122',
+    'Twin (2020, Movie) #133',
+    'Twin #144',
+  ];
+  await expect(picker.locator('option')).toHaveText(labels);
+  await picker.selectOption({ label: labels[2] });
+  await page.getByRole('button', { name: 'Paused', exact: true }).click();
+  await expect.poll(() => writes).toEqual([22]);
+  await picker.selectOption({ label: labels[1] });
+  release();
+  const failure = page.getByRole('alert').filter({ hasText: 'Could not confirm' });
+  await expect(failure).toHaveText(/^Twin \(2020, Movie\) #122.*Could not confirm/);
+  await expect(page.getByRole('button', { name: 'Watching', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await picker.selectOption({ label: labels[2] });
+  await expect(page.getByText(/Could not confirm/)).toHaveCount(1);
+  await picker.selectOption('');
+  await expect(failure).toBeVisible();
+  await picker.selectOption('11');
+  await page.getByRole('button', { name: 'Dropped', exact: true }).click();
+  await expect(failure).toHaveCount(2);
+  await expect(failure.filter({ hasText: labels[1] })).toBeVisible();
+  await expect(failure.filter({ hasText: labels[2] })).toBeVisible();
+});
+
+test('explains how to enable editing after an offline start and enables it on pull-to-refresh', async ({ page }) => {
+  let online = true;
+  let viewerReads = 0;
+  await page.route('https://graphql.anilist.co/**', async (route) => {
+    const { query } = route.request().postDataJSON();
+    if (query.includes('Viewer')) {
+      viewerReads++;
+      if (!online) return route.abort('internetdisconnected');
+      return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+    }
+    expect(query).toContain('MediaListCollection');
+    return route.fulfill({
+      json: {
+        data: {
+          MediaListCollection: { hasNextChunk: false, lists: [{ entries: [entry(11, 'First title', 'CURRENT')] }] },
+        },
+      },
+    });
+  });
+  await page.goto('/');
+  const picker = page.getByLabel('Anime in your list');
+  await picker.selectOption('11');
+  await expect(page.getByRole('button', { name: 'Paused' })).toBeEnabled();
+  online = false;
+  await page.reload();
+  await picker.selectOption('11');
+  const hint = page.getByText(/Reconnect.*pull down to refresh/i);
+  await expect(hint).toBeVisible();
+  await expect(page.locator('fieldset button:disabled')).toHaveCount(6);
+  online = true;
+  const readsBeforeRefresh = viewerReads;
+  await page.locator('ion-refresher').dispatchEvent('ionRefresh');
+  await expect(page.getByRole('button', { name: 'Paused' })).toBeEnabled();
+  expect(viewerReads).toBe(readsBeforeRefresh + 1);
+  await expect(hint).toHaveCount(0);
 });

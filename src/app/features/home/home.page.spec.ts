@@ -30,6 +30,7 @@ describe('HomePage list summary', () => {
       fetchedAt: signal(noon - 10 * 86_400_000),
       checkedAt: signal(noon - 60_000),
       refreshing: signal(false),
+      statusEdits: signal(new Map()),
       message: signal<string | null>(null),
       now: signal(noon),
       refresh: async () => undefined,
