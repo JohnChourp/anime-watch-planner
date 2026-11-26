@@ -26,7 +26,7 @@ describe('HomePage list summary', () => {
   it('says when the list was last checked, not when it was last fetched in full', () => {
     const noon = new Date(2026, 10, 25, 12).getTime();
     const list = {
-      entries: signal([{}, {}, {}]),
+      entries: signal([1, 2, 3].map((id) => ({ id, media: { id, title: { english: null, romaji: 'Test' } } }))),
       fetchedAt: signal(noon - 10 * 86_400_000),
       checkedAt: signal(noon - 60_000),
       refreshing: signal(false),

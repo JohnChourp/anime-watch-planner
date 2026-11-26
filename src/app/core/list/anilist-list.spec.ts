@@ -1,6 +1,6 @@
 import { UnauthorizedError } from '../auth/anilist-viewer';
 
-import { fetchChanges, fetchList, RateLimitedError } from './anilist-list';
+import { fetchChanges, fetchList, RateLimitedError, saveStatus } from './anilist-list';
 
 const raw = (id: number, updatedAt = 100) => ({
   id,
@@ -9,6 +9,8 @@ const raw = (id: number, updatedAt = 100) => ({
   repeat: null,
   updatedAt,
   score: 8.5,
+  startedAt: { year: 2025, month: null, day: null },
+  completedAt: null,
   media: {
     id: id * 10,
     format: 'TV',
@@ -48,6 +50,8 @@ describe('fetchList', () => {
       status: 'CURRENT',
       progress: 3,
       score: 8.5,
+      startedAt: { year: 2025, month: null, day: null },
+      completedAt: null,
       repeat: 0,
       updatedAt: 100,
       media: {
@@ -103,6 +107,35 @@ describe('fetchList', () => {
 
 const changesPage = (entries: unknown[], hasNextPage = false) => ({
   data: { Page: { pageInfo: { hasNextPage }, mediaList: entries } },
+});
+
+describe('saveStatus', () => {
+  it('updates an existing entry by id and asks for its confirmed list fields', async () => {
+    const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body));
+      expect(sent.query).toContain('SaveMediaListEntry(id: $id, status: $status)');
+      expect(sent.variables).toEqual({ id: 3, status: 'PAUSED' });
+      expect(sent.query).toContain('completedAt');
+      return Response.json({ data: { SaveMediaListEntry: { ...raw(3), status: 'PAUSED' } } });
+    });
+    const result = await saveStatus('tok', 3, 'PAUSED', send, {});
+    expect(result).toMatchObject({
+      id: 3,
+      status: 'PAUSED',
+      score: 8.5,
+      startedAt: { year: 2025, month: null, day: null },
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { data: { SaveMediaListEntry: null } },
+    { data: { SaveMediaListEntry: raw(2) } },
+    { data: { SaveMediaListEntry: { ...raw(3), status: 'PLANNING' } } },
+    { data: { SaveMediaListEntry: raw(3) }, errors: [{ message: 'Incomplete result' }] },
+  ])('requires a complete confirmation for the requested entry and status', async (body) => {
+    await expect(saveStatus('tok', 3, 'CURRENT', async () => Response.json(body), {})).rejects.toThrow();
+  });
 });
 
 function pagesFetch(pages: unknown[]) {

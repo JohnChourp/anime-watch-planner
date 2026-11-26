@@ -32,3 +32,69 @@
   margin-top: var(--app-space-4);
   --border-radius: var(--app-radius-m);
 }
+
+.editor {
+  width: min(100%, 30rem);
+  margin-top: var(--app-space-4);
+  text-align: start;
+
+  label,
+  legend {
+    font-weight: 600;
+  }
+
+  select,
+  button {
+    min-height: var(--app-touch-min);
+    padding: var(--app-space-2) var(--app-space-3);
+    border: 1px solid var(--ion-color-medium);
+    border-radius: var(--app-radius-s);
+    background: var(--ion-background-color, white);
+    color: var(--ion-text-color, black);
+    font: inherit;
+  }
+
+  select {
+    display: block;
+    width: 100%;
+    margin-top: var(--app-space-2);
+  }
+
+  fieldset {
+    margin: var(--app-space-4) 0 0;
+    padding: 0;
+    border: 0;
+  }
+
+  .statuses {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--app-space-2);
+    margin: var(--app-space-2) 0;
+  }
+
+  button {
+    position: relative;
+    padding-inline: var(--app-space-5);
+    overflow-wrap: anywhere;
+  }
+
+  button[aria-pressed='true'] {
+    background: var(--ion-text-color, black);
+    color: var(--ion-background-color, white);
+    font-weight: 600;
+  }
+
+  ion-spinner {
+    position: absolute;
+    inset-inline-end: var(--app-space-1);
+    top: 50%;
+    width: var(--app-space-4);
+    transform: translateY(-50%);
+  }
+
+  .feedback {
+    min-height: 2.8em;
+    color: var(--ion-text-color, black);
+  }
+}

@@ -25,7 +25,48 @@
     <p class="summary" role="status">{{ summary }}</p>
     } @if (list.message(); as message) {
     <p class="message" role="alert">{{ message }}</p>
-    }
+    } @if (list.entries(); as entries) { @if (entries.length) {
+    <div class="editor">
+      <label for="existing-title">Anime in your list</label>
+      <select
+        id="existing-title"
+        #titlePicker
+        [value]="selectedId() ?? ''"
+        (change)="selectedId.set(+titlePicker.value || null)"
+      >
+        <option value="">Choose a title</option>
+        @for (entry of entries; track entry.id) {
+        <option [value]="entry.id">
+          {{ entry.media.title.english || entry.media.title.romaji || 'Anime #' + entry.media.id }}
+        </option>
+        }
+      </select>
+      @if (selected(); as entry) { @let edit = list.statusEdits().get(entry.id);
+      <fieldset>
+        <legend>Watch status</legend>
+        <div class="statuses">
+          @for (choice of statuses; track choice.value) {
+          <button
+            type="button"
+            [attr.aria-pressed]="entry.status === choice.value"
+            [disabled]="!auth.viewer() || (edit?.pending ?? entry.status) === choice.value"
+            (click)="list.changeStatus(entry.id, choice.value)"
+          >
+            {{ choice.label }} @if (edit?.pending === choice.value) {
+            <ion-spinner name="dots" aria-hidden="true"></ion-spinner>
+            }
+          </button>
+          }
+        </div>
+      </fieldset>
+      <p class="feedback" role="status">
+        {{ auth.viewer() ? edit?.message : 'Reconnect to AniList to change this title.' }}
+      </p>
+      }
+    </div>
+    } @else {
+    <p>Your AniList anime list is empty.</p>
+    } }
     <ion-button class="action" fill="outline" (click)="auth.signOut()">Sign out</ion-button>
   </section>
   } @else {

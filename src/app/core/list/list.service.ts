@@ -4,13 +4,18 @@ import { App } from '@capacitor/app';
 import { UnauthorizedError } from '../auth/anilist-viewer';
 import { AuthService } from '../auth/auth.service';
 
-import { fetchChanges, fetchList, RateLimitedError, type ListEntry } from './anilist-list';
+import { fetchChanges, fetchList, RateLimitedError, saveStatus, type ListEntry, type ListStatus } from './anilist-list';
 import { CACHE_VERSION, ListStore, type CachedList } from './list-store';
 
 /** The "monthly" refresh: a saved list older than this is fetched again in full. */
 export const LIST_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** A fresh list is checked for changes on start or resume, at most this often. */
 export const CHANGES_INTERVAL_MS = 15 * 60 * 1000;
+
+interface StatusEdit {
+  pending: ListStatus | null;
+  message: string;
+}
 
 /**
  * The user's AniList list, kept on the device. It loads the saved copy at once and fetches the whole list again
@@ -34,6 +39,7 @@ export class ListService {
   /** When the list was last fetched in full or checked for changes (device time, ms), or null. */
   readonly checkedAt = signal<number | null>(null);
   readonly refreshing = signal(false);
+  readonly statusEdits = signal<ReadonlyMap<number, StatusEdit>>(new Map());
   /** A short, plain message when the list could not be fetched. */
   readonly message = signal<string | null>(null);
   /** Device time of the last start or resume, so "updated today" and the 30-day check follow the calendar. */
@@ -87,6 +93,94 @@ export class ListService {
     });
   }
 
+  /** Taps on one title coalesce. Confirmed writes and refreshes use the same serial queue. */
+  async changeStatus(id: number, status: ListStatus): Promise<void> {
+    const userId = this.auth.viewer()?.id;
+    const token = this.auth.accessToken();
+    const entry = this.cache?.entries.find((item) => item.id === id);
+    if (!entry || !userId || !token || this.cache?.userId !== userId || this.auth.status() !== 'signedIn') {
+      return;
+    }
+    const previous = this.statusEdits().get(id);
+    if (status === (previous?.pending ?? entry.status)) {
+      return;
+    }
+    const generation = this.generation;
+    const sameSession = () =>
+      this.generation === generation &&
+      this.auth.status() === 'signedIn' &&
+      this.auth.viewer()?.id === userId &&
+      this.auth.accessToken() === token;
+    let edit: StatusEdit = { pending: status, message: 'Saving to AniList…' };
+    const current = () => this.statusEdits().get(id) === edit;
+    this.setStatusEdit(id, edit);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await this.run(async () => {
+      if (!current()) return;
+      if (!sameSession()) {
+        this.setStatusEdit(id, null);
+        return;
+      }
+      const cache = this.cache;
+      const existing = cache?.entries.find((item) => item.id === id);
+      if (!cache || cache.userId !== userId || existing?.media.id !== entry.media.id) {
+        this.setStatusEdit(id, { pending: null, message: 'This title is no longer in your list. Refresh your list.' });
+        return;
+      }
+      // The shared gate may wait before dispatch. A newer tap or a sign-out cancels a still-unsent write.
+      const send: typeof fetch = (url, init) => {
+        if (!current() || !sameSession()) throw new Error('Status change cancelled.');
+        return this.fetchFn(url, init);
+      };
+      try {
+        const confirmed = await saveStatus(token, id, status, send, {
+          onWait: (seconds) => {
+            if (current() && sameSession()) {
+              edit = { pending: status, message: `AniList is busy. Waiting ${seconds} s…` };
+              this.setStatusEdit(id, edit);
+            }
+          },
+        });
+        if (!sameSession()) return;
+        if (confirmed.media.id !== existing.media.id) throw new Error('AniList returned a different title.');
+        // Only this entry was checked. Advancing the list watermark could skip other titles changed on AniList.
+        const stored = await this.save({
+          ...cache,
+          entries: cache.entries.map((item) => (item.id === id ? confirmed : item)),
+        });
+        if (current()) {
+          this.setStatusEdit(id, {
+            pending: null,
+            message: stored ? 'Saved to AniList.' : 'Saved to AniList. This device could not store the change.',
+          });
+        }
+      } catch (error) {
+        if (!sameSession()) return;
+        if (error instanceof UnauthorizedError) {
+          await this.auth.expire();
+        } else if (current()) {
+          const message =
+            error instanceof RateLimitedError
+              ? 'AniList is busy. Try again in a minute.'
+              : 'Could not confirm the change. Refresh your list and try again.';
+          this.setStatusEdit(id, { pending: null, message });
+        }
+      } finally {
+        // A viewer can change while a request waits, before the sign-out effect clears the list.
+        if (current()) this.setStatusEdit(id, null);
+      }
+    });
+  }
+
+  private setStatusEdit(id: number, edit: StatusEdit | null): void {
+    this.statusEdits.update((edits) => {
+      const next = new Map(edits);
+      if (edit) next.set(id, edit);
+      else next.delete(id);
+      return next;
+    });
+  }
+
   /**
    * Signed in: show the saved list at once, then fetch it again if it is missing, 30 days old or someone else's,
    * or else check it for changes if the last check was 15 minutes ago or more.
@@ -127,6 +221,7 @@ export class ListService {
   /** Sign-out: forget the list on this device. */
   async clear(): Promise<void> {
     this.generation++;
+    this.statusEdits.set(new Map());
     this.loaded = false;
     this.show(null);
     this.message.set(null);
@@ -175,6 +270,7 @@ export class ListService {
       };
       this.loaded = true;
       this.message.set(null);
+      this.statusEdits.update((edits) => new Map([...edits].filter(([, edit]) => edit.pending !== null)));
       await this.save(list);
     } catch (error) {
       await this.fail(error, generation);
@@ -222,11 +318,14 @@ export class ListService {
     await this.fetchAndSave(userId, now, generation);
   }
 
-  private async save(list: CachedList): Promise<void> {
+  private async save(list: CachedList): Promise<boolean> {
     this.show(list);
-    await this.store.write(list).catch(() => {
-      // Still shown; the next start fetches it again.
-    });
+    try {
+      await this.store.write(list);
+      return true;
+    } catch {
+      return false; // Still available in memory.
+    }
   }
 
   private async fail(error: unknown, generation: number): Promise<void> {

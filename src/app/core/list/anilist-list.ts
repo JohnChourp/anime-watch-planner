@@ -5,6 +5,12 @@ import { ANILIST } from '../auth/anilist.config';
 /** AniList list statuses; the app's six states map 1:1 to them. */
 export type ListStatus = 'CURRENT' | 'PLANNING' | 'COMPLETED' | 'DROPPED' | 'PAUSED' | 'REPEATING';
 
+interface ListDate {
+  year: number | null;
+  month: number | null;
+  day: number | null;
+}
+
 /** One entry of the user's anime list, with only the fields the list screens need (decided 2026-11-25). */
 export interface ListEntry {
   id: number;
@@ -13,6 +19,9 @@ export interface ListEntry {
   /** 0–10; 0 means "no score given". */
   score: number;
   repeat: number;
+  /** Older on-device lists have no dates until their entries are refreshed. */
+  startedAt?: ListDate | null;
+  completedAt?: ListDate | null;
   /** AniList server time, in seconds. */
   updatedAt: number;
   media: {
@@ -46,6 +55,8 @@ const CHUNK_PAUSE_MS = 1500;
 /** The entry fields both queries ask for (decided 2026-11-25: list fields only). */
 const ENTRY_FIELDS = `
   id status progress repeat updatedAt
+  startedAt { year month day }
+  completedAt { year month day }
   score(format: POINT_10_DECIMAL)
   media {
     id format episodes status season seasonYear
@@ -78,6 +89,8 @@ interface RawEntry {
   status: ListStatus;
   progress: number | null;
   repeat: number | null;
+  startedAt: ListDate | null;
+  completedAt: ListDate | null;
   updatedAt: number | null;
   score: number | null;
   media: {
@@ -99,6 +112,29 @@ interface CollectionData {
 
 interface ChangesData {
   Page?: { pageInfo: { hasNextPage: boolean | null } | null; mediaList: RawEntry[] | null } | null;
+}
+
+/** Address an existing list entry by its entry id. AniList supplies the confirmed fields, including dates. */
+export async function saveStatus(
+  accessToken: string,
+  id: number,
+  status: ListStatus,
+  fetchFn: typeof fetch,
+  options: GateOptions,
+): Promise<ListEntry> {
+  const mutation = `mutation ($id: Int!, $status: MediaListStatus!) {
+    SaveMediaListEntry(id: $id, status: $status) { ${ENTRY_FIELDS} }
+  }`;
+  const data = await post<{ SaveMediaListEntry?: RawEntry | null }>(accessToken, mutation, { id, status }, fetchFn, {
+    ...options,
+    requireComplete: true,
+  });
+  const raw = data.SaveMediaListEntry;
+  const entry = raw && toEntry(raw);
+  if (!entry || entry.id !== id || entry.status !== status) {
+    throw new Error('AniList did not confirm the status change.');
+  }
+  return entry;
 }
 
 /**
@@ -185,7 +221,7 @@ async function post<T>(
   query: string,
   variables: Record<string, unknown>,
   fetchFn: typeof fetch,
-  options: GateOptions = {},
+  options: GateOptions & { requireComplete?: boolean } = {},
 ): Promise<T> {
   const init: RequestInit = {
     method: 'POST',
@@ -213,7 +249,7 @@ async function post<T>(
   if (body.errors?.some((e) => e.status === 429)) {
     throw new RateLimitedError();
   }
-  if (!response.ok || !body.data) {
+  if (!response.ok || !body.data || (options.requireComplete && body.errors?.length)) {
     throw new Error(`AniList list request failed (${response.status}).`);
   }
   return body.data;
@@ -230,6 +266,8 @@ function toEntry(raw: RawEntry): ListEntry | null {
     progress: raw.progress ?? 0,
     score: raw.score ?? 0,
     repeat: raw.repeat ?? 0,
+    startedAt: raw.startedAt ?? null,
+    completedAt: raw.completedAt ?? null,
     updatedAt: raw.updatedAt ?? 0,
     media: {
       id: media.id,

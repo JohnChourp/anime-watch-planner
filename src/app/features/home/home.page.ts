@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, linkedSignal } from '@angular/core';
 import {
   IonButton,
   IonContent,
@@ -12,6 +12,7 @@ import {
 } from '@ionic/angular';
 
 import { AuthService } from '../../core/auth/auth.service';
+import type { ListEntry, ListStatus } from '../../core/list/anilist-list';
 import { ListService } from '../../core/list/list.service';
 
 @Component({
@@ -30,6 +31,22 @@ export class HomePage {
   protected readonly signingIn = computed(() => this.auth.status() === 'signingIn');
 
   protected readonly list = inject(ListService);
+  protected readonly statuses = [
+    { value: 'CURRENT', label: 'Watching' },
+    { value: 'PLANNING', label: 'Planning' },
+    { value: 'COMPLETED', label: 'Completed' },
+    { value: 'REPEATING', label: 'Rewatching' },
+    { value: 'PAUSED', label: 'Paused' },
+    { value: 'DROPPED', label: 'Dropped' },
+  ] as const satisfies readonly { value: ListStatus; label: string }[];
+  protected readonly selectedId = linkedSignal<ListEntry[] | null, number | null>({
+    source: this.list.entries,
+    computation: (entries, previous) => {
+      const id = previous?.value ?? null;
+      return entries?.some((entry) => entry.id === id) ? id : null;
+    },
+  });
+  protected readonly selected = computed(() => this.list.entries()?.find((entry) => entry.id === this.selectedId()));
   /** "437 anime · updated today", or what is happening while there is no list yet. */
   protected readonly listSummary = computed(() => {
     const entries = this.list.entries();

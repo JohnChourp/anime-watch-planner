@@ -391,4 +391,123 @@ describe('ListService', () => {
     await vi.waitFor(() => expect(store.deletes).toBeGreaterThan(0));
     expect(list.entries()).toBeNull();
   });
+
+  describe('changing the status of an existing entry', () => {
+    beforeEach(async () => {
+      store.saved = saved(me.id, Date.now());
+      auth.viewer.set(me);
+      auth.status.set('signedIn');
+      TestBed.tick();
+      await list.sync(me.id);
+    });
+
+    it('sends the last rapid choice per title, merges each confirmation, and keeps the list watermark', async () => {
+      const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        const { id, status } = JSON.parse(String(init?.body)).variables;
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(id, 105), status, progress: 7 } } });
+      });
+      list.useFetch(send);
+      const initial = store.saved!;
+      await Promise.all([
+        list.changeStatus(1, 'PLANNING'),
+        list.changeStatus(1, 'PAUSED'),
+        list.changeStatus(2, 'REPEATING'),
+      ]);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(store.saved?.entries.map((e) => [e.status, e.progress])).toEqual([
+        ['PAUSED', 7],
+        ['REPEATING', 7],
+      ]);
+      expect(store.saved).toMatchObject({
+        watermark: initial.watermark,
+        checkedAt: initial.checkedAt,
+        fetchedAt: initial.fetchedAt,
+      });
+      expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+    });
+
+    it('clears a pending selection on failure, retains the confirmed row and lets the user retry', async () => {
+      const original = store.saved;
+      list.useFetch(async () => Response.json({}, { status: 500 }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(store.saved).toBe(original);
+      expect(list.statusEdits().get(1)).toMatchObject({
+        pending: null,
+        message: expect.stringContaining('Could not confirm'),
+      });
+      list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: { ...entry(1, 62), status: 'PAUSED' } } }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+      expect(store.saved?.entries[1]).toBe(original?.entries[1]);
+    });
+
+    it('never sends a queued change for a different account, a missing entry or a signed-out session', async () => {
+      const send = vi.fn(listFetch(200, [entry(90, 60)]).fn);
+      list.useFetch(send);
+      await list.changeStatus(99, 'PAUSED');
+      const pending = list.changeStatus(1, 'PAUSED');
+      auth.viewer.set({ id: 9, name: 'other' });
+      await pending;
+      await list.changeStatus(1, 'PAUSED');
+      auth.viewer.set(me);
+      const last = list.changeStatus(1, 'DROPPED');
+      await list.clear();
+      await last;
+      expect(send.mock.calls.filter(([, init]) => String(init?.body).includes('SaveMediaListEntry'))).toHaveLength(0);
+      expect(list.statusEdits().size).toBe(0);
+    });
+
+    it('does not restore a signed-out list when an in-flight write answers', async () => {
+      let release!: (response: Response) => void;
+      const send = vi.fn(() => new Promise<Response>((resolve) => (release = resolve)));
+      list.useFetch(send);
+      const pending = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const clear = list.clear();
+      release(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 60), status: 'PAUSED' } } }));
+      await Promise.all([clear, pending]);
+      expect(list.entries()).toBeNull();
+      expect(store.saved).toBeNull();
+      expect(list.statusEdits().size).toBe(0);
+    });
+
+    it('reports a 429 without replaying the write, and a 401 asks for sign-in again', async () => {
+      const limited = vi.fn(async () => Response.json({}, { status: 429, headers: { 'Retry-After': '1' } }));
+      list.useFetch(limited);
+      await list.changeStatus(1, 'PAUSED');
+      expect(limited).toHaveBeenCalledTimes(1);
+      expect(list.statusEdits().get(1)?.message).toContain('busy');
+      list.useFetch(async () => Response.json({}, { status: 401 }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(auth.expired).toBe(1);
+    });
+
+    it('distinguishes a confirmed remote change from a failed device save', async () => {
+      store.write = async () => {
+        throw new Error('disk full');
+      };
+      list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(list.entries()?.[0].status).toBe('PAUSED');
+      expect(list.statusEdits().get(1)?.message).toContain('This device could not store');
+    });
+
+    it('keeps a later choice on the same title when the first confirmation arrives', async () => {
+      let reply!: (response: Response) => void;
+      const send = vi
+        .fn()
+        .mockImplementationOnce(() => new Promise<Response>((r) => (reply = r)))
+        .mockResolvedValueOnce(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 62), status: 'DROPPED' } } }));
+      list.useFetch(send);
+      const first = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const last = list.changeStatus(1, 'DROPPED');
+      reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 61), status: 'PAUSED' } } }));
+      await first;
+      expect(list.statusEdits().get(1)?.pending).toBe('DROPPED');
+      await last;
+      expect(store.saved?.entries[0].status).toBe('DROPPED');
+      expect(list.statusEdits().get(1)?.pending).toBe(null);
+    });
+  });
 });
