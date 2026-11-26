@@ -10,6 +10,7 @@ import { CACHE_VERSION, ListStore, type CachedList } from './list-store';
 import { CHANGES_INTERVAL_MS, LIST_TTL_MS, ListService } from './list.service';
 
 class FakeAuth {
+  sessionId = signal('test-session');
   status = signal<AuthStatus>('loading');
   viewer = signal<Viewer | null>(null);
   token: string | null = 'tok';
@@ -29,19 +30,25 @@ class FakeAuth {
 }
 
 class FakeStore {
+  needsRefresh = false;
   saved: CachedList | null = null;
   writes = 0;
   deletes = 0;
   async read() {
-    return this.saved;
+    return this.needsRefresh ? null : this.saved;
   }
   async write(list: CachedList) {
     this.writes++;
     this.saved = list;
+    this.needsRefresh = false;
+  }
+  async invalidate() {
+    this.needsRefresh = true;
   }
   async delete() {
     this.deletes++;
     this.saved = null;
+    this.needsRefresh = false;
   }
 }
 
@@ -73,6 +80,7 @@ function listFetch(status: number, entries = [entry(1, 50), entry(2, 90)], chang
 
 const saved = (userId: number, fetchedAt: number, checkedAt = fetchedAt): CachedList => ({
   version: CACHE_VERSION,
+  sessionId: 'test-session',
   userId,
   fetchedAt,
   checkedAt,
@@ -154,6 +162,29 @@ describe('ListService', () => {
     await list.refresh(now + 1);
     expect(calls.length).toBe(1);
     expect(list.fetchedAt()).toBe(now + 1);
+  });
+
+  it.each([undefined, 'earlier-session'])(
+    'requires online owner verification for an unbound cache (%s)',
+    async (sessionId) => {
+      store.saved = { ...saved(me.id, now), sessionId };
+      await list.sync(null, now);
+      expect(list.entries()).toBeNull();
+      const { fn, calls } = listFetch(200);
+      list.useFetch(fn);
+      await list.sync(me.id, now);
+      expect(list.entries()).toHaveLength(2);
+      expect(store.saved?.sessionId).toBe(auth.sessionId());
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it('hides a verified offline list immediately when the active session changes', async () => {
+    store.saved = saved(me.id, now);
+    await list.sync(null, now);
+    expect(list.entries()).toHaveLength(2);
+    auth.sessionId.set('new-session');
+    expect(list.entries()).toBeNull();
   });
 
   it('pull-to-refresh while AniList cannot be reached says so', async () => {
@@ -436,6 +467,40 @@ describe('ListService', () => {
       expect(send).not.toHaveBeenCalled();
       expect(list.statusEdits().has(1)).toBe(false);
       expect(store.writes).toBe(0);
+    });
+
+    it('accepts an explicit undo after a lost reply and suppresses a repeat once confirmed', async () => {
+      const writes: string[] = [];
+      list.useFetch(async (_, init) => {
+        const { id, status } = JSON.parse(String(init?.body)).variables;
+        writes.push(status);
+        if (writes.length === 1) throw new Error('Lost reply');
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(id, 112), status } } });
+      });
+      await list.changeStatus(1, 'PAUSED');
+      expect(list.canSelectStatus(list.entries()![0], 'CURRENT')).toBe(true);
+      await list.changeStatus(1, 'CURRENT');
+      expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+      await list.changeStatus(1, 'CURRENT');
+      expect(writes).toEqual(['PAUSED', 'CURRENT']);
+    });
+
+    it('keeps a queued edit and its row when a refresh returns only part of a list', async () => {
+      let finish!: (response: Response) => void;
+      const incomplete = new Promise<Response>((resolve) => (finish = resolve));
+      const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(init?.body).includes('MediaListCollection')) return incomplete;
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 112), status: 'PAUSED' } } });
+      });
+      list.useFetch(send);
+      const refresh = list.refresh();
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+      const edit = list.changeStatus(1, 'PAUSED');
+      finish(Response.json({ data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: null }] } } }));
+      await Promise.all([refresh, edit]);
+      expect(list.entries()?.map((row) => row.id)).toEqual([1, 2]);
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+      expect(send).toHaveBeenCalledTimes(2);
     });
 
     it.each([true, false])(

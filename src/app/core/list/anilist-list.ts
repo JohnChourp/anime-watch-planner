@@ -3,7 +3,8 @@ import { UnauthorizedError } from '../auth/anilist-viewer';
 import { ANILIST } from '../auth/anilist.config';
 
 /** AniList list statuses; the app's six states map 1:1 to them. */
-export type ListStatus = 'CURRENT' | 'PLANNING' | 'COMPLETED' | 'DROPPED' | 'PAUSED' | 'REPEATING';
+export const LIST_STATUSES = ['CURRENT', 'PLANNING', 'COMPLETED', 'DROPPED', 'PAUSED', 'REPEATING'] as const;
+export type ListStatus = (typeof LIST_STATUSES)[number];
 
 interface ListDate {
   year: number | null;
@@ -125,10 +126,13 @@ export async function saveStatus(
   const mutation = `mutation ($id: Int!, $status: MediaListStatus!) {
     SaveMediaListEntry(id: $id, status: $status) { ${ENTRY_FIELDS} }
   }`;
-  const data = await post<{ SaveMediaListEntry?: RawEntry | null }>(accessToken, mutation, { id, status }, fetchFn, {
-    ...options,
-    requireComplete: true,
-  });
+  const data = await post<{ SaveMediaListEntry?: RawEntry | null }>(
+    accessToken,
+    mutation,
+    { id, status },
+    fetchFn,
+    options,
+  );
   const raw = data.SaveMediaListEntry;
   const entry = raw && toEntry(raw);
   if (!entry || entry.id !== id || entry.status !== status) {
@@ -156,12 +160,13 @@ export async function fetchList(
     const variables = { userId, chunk, perChunk: PER_CHUNK };
     const collection = (await post<CollectionData>(accessToken, QUERY, variables, fetchFn, options))
       .MediaListCollection;
-    if (!collection) {
-      throw new Error('AniList list request failed (no list).');
+    if (!Array.isArray(collection?.lists) || typeof collection.hasNextChunk !== 'boolean') {
+      throw new Error('AniList returned an incomplete list.');
     }
     // Custom lists repeat entries, so keep each entry id once.
-    for (const list of collection.lists ?? []) {
-      for (const raw of list.entries ?? []) {
+    for (const list of collection.lists) {
+      if (!Array.isArray(list?.entries)) throw new Error('AniList returned an incomplete list group.');
+      for (const raw of list.entries) {
         const entry = toEntry(raw);
         if (entry) {
           byId.set(entry.id, entry);
@@ -196,10 +201,10 @@ export async function fetchChanges(
     }
     const variables = { userId, page, perPage: CHANGES_PER_PAGE };
     const result = (await post<ChangesData>(accessToken, CHANGES_QUERY, variables, fetchFn)).Page;
-    if (!result) {
-      throw new Error('AniList list request failed (no page).');
+    if (!Array.isArray(result?.mediaList) || typeof result.pageInfo?.hasNextPage !== 'boolean') {
+      throw new Error('AniList returned an incomplete page of changes.');
     }
-    for (const raw of result.mediaList ?? []) {
+    for (const raw of result.mediaList) {
       if ((raw.updatedAt ?? 0) < since) {
         return changed;
       }
@@ -221,7 +226,7 @@ async function post<T>(
   query: string,
   variables: Record<string, unknown>,
   fetchFn: typeof fetch,
-  options: GateOptions & { requireComplete?: boolean } = {},
+  options: GateOptions = {},
 ): Promise<T> {
   const init: RequestInit = {
     method: 'POST',
@@ -249,7 +254,7 @@ async function post<T>(
   if (body.errors?.some((e) => e.status === 429)) {
     throw new RateLimitedError();
   }
-  if (!response.ok || !body.data || (options.requireComplete && body.errors?.length)) {
+  if (!response.ok || !body.data || body.errors?.length) {
     throw new Error(`AniList list request failed (${response.status}).`);
   }
   return body.data;

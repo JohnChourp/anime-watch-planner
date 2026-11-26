@@ -75,6 +75,37 @@ describe('AuthService', () => {
     expect(auth.status()).toBe('signedIn');
     expect(auth.viewer()).toEqual({ id: 7, name: 'Tester' });
     expect(auth.accessToken(now)).toBe('t');
+    expect(platform.saved?.sessionId).toEqual(expect.any(String));
+  });
+
+  it('restores the same local session identity offline without rewriting the token', async () => {
+    platform.saved = { accessToken: 't', expiresAt: now + 1000, sessionId: 'known-session' };
+    const write = vi.spyOn(platform, 'writeToken');
+    auth.useFetch(async () => {
+      throw new Error('offline');
+    });
+    await auth.start(now);
+    expect(auth.sessionId()).toBe('known-session');
+    expect(auth.viewer()).toBeNull();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it('ignores a delayed viewer result after the session has ended', async () => {
+    platform.saved = { accessToken: 't', expiresAt: now + 1000, sessionId: 'known-session' };
+    let finish!: (response: Response) => void;
+    auth.useFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const start = auth.start(now);
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    await auth.signOut();
+    finish(Response.json({ data: { Viewer: { id: 7, name: 'Demo' } } }));
+    await start;
+    expect(auth.sessionId()).toBeUndefined();
+    expect(auth.viewer()).toBeNull();
   });
 
   it('signs out with a message when the saved token has expired', async () => {
@@ -114,7 +145,8 @@ describe('AuthService', () => {
     const state = await startSignIn();
     await auth.handleRedirect(`com.john.animewatchplanner://auth#access_token=new&expires_in=60&state=${state}`, now);
     expect(platform.pending).toBeNull();
-    expect(platform.saved).toEqual({ accessToken: 'new', expiresAt: now + 60_000 });
+    expect(platform.saved).toEqual({ accessToken: 'new', expiresAt: now + 60_000, sessionId: auth.sessionId() });
+    expect(auth.sessionId()).toEqual(expect.any(String));
     expect(platform.closed).toBe(1);
     expect(auth.status()).toBe('signedIn');
     expect(auth.viewer()?.name).toBe('Tester');

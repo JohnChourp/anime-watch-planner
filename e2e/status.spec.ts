@@ -33,15 +33,16 @@ async function simulateFullDisk(page: Page) {
 
 test.beforeEach(async ({ page }) => {
   // Restore the session through the web storage adapter in this isolated browser context.
-  await page.addInitScript(() =>
-    localStorage.setItem(
-      'capacitor-storage_anilist.token',
-      JSON.stringify({
-        accessToken: 'local-test-session',
-        expiresAt: Date.now() + 3600_000,
-      }),
-    ),
-  );
+  await page.addInitScript(() => {
+    if (!localStorage.getItem('capacitor-storage_anilist.token'))
+      localStorage.setItem(
+        'capacitor-storage_anilist.token',
+        JSON.stringify({
+          accessToken: 'local-test-session',
+          expiresAt: Date.now() + 3600_000,
+        }),
+      );
+  });
 });
 
 const entry = (id: number, title: string, state: string) => ({
@@ -248,6 +249,129 @@ test('shows the offline warning when a refresh confirms the selected status befo
   await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'PAUSED' }] });
   await expect(warning).toHaveCount(0);
   expect(writes).toBe(0);
+});
+
+test('starts offline with a damaged cache and restores the picker when AniList is reachable', async ({ page }) => {
+  let online = true;
+  let reads = 0;
+  await page.route('https://graphql.anilist.co/**', (route) => {
+    const { query } = route.request().postDataJSON();
+    if (!online) return route.abort('internetdisconnected');
+    if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+    reads++;
+    return route.fulfill({
+      json: {
+        data: {
+          MediaListCollection: {
+            hasNextChunk: false,
+            lists: [{ entries: [entry(11, 'First title', 'CURRENT')] }],
+          },
+        },
+      },
+    });
+  });
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  const picker = page.getByLabel('Anime in your list');
+  await page.goto('/');
+  await picker.selectOption('11');
+  await expect.poll(() => readOfflineList(page)).toMatchObject({ userId: 5 });
+  await page.evaluate(
+    async (options) => {
+      const fs = window.Capacitor.Plugins.Filesystem;
+      const file = JSON.parse(String((await fs.readFile(options)).data));
+      delete file.entries[0].media.title;
+      await fs.writeFile({ ...options, data: JSON.stringify(file) });
+    },
+    { path: 'anilist-list.json', directory: Directory.LibraryNoCloud, encoding: Encoding.UTF8 },
+  );
+  online = false;
+  await page.reload();
+  await expect(page.getByText('Pull down to load your list.')).toBeVisible();
+  await expect(picker).toHaveCount(0);
+  online = true;
+  await page.locator('ion-refresher').dispatchEvent('ionRefresh');
+  await picker.selectOption('11');
+  await expect(page.getByRole('button', { name: 'Watching', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  expect(errors).toEqual([]);
+  expect(reads).toBe(2);
+});
+
+test('restores the confirmed status on restart even while the old offline file is fresh', async ({ page }) => {
+  let status = 'CURRENT';
+  let online = true;
+  let fullReads = 0;
+  await page.route('https://graphql.anilist.co/**', (route) => {
+    const { query, variables } = route.request().postDataJSON();
+    if (!online) return route.abort('internetdisconnected');
+    if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+    if (query.includes('SaveMediaListEntry')) {
+      status = variables.status;
+      return route.fulfill({ json: { data: { SaveMediaListEntry: entry(11, 'First title', status) } } });
+    }
+    fullReads++;
+    return route.fulfill({
+      json: {
+        data: {
+          MediaListCollection: {
+            hasNextChunk: false,
+            lists: [{ entries: [entry(11, 'First title', status)] }],
+          },
+        },
+      },
+    });
+  });
+  const picker = page.getByLabel('Anime in your list');
+  await page.goto('/');
+  await picker.selectOption('11');
+  await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'CURRENT' }] });
+  await simulateFullDisk(page);
+  await page.getByRole('button', { name: 'Paused', exact: true }).click();
+  await expect(page.getByText('Saved to AniList.', { exact: true })).toBeVisible();
+  await expect(page.getByText(/offline copy on this device/)).toBeVisible();
+  expect(status).toBe('PAUSED');
+  online = false;
+  await page.reload();
+  await expect(page.getByText(/refresh to restore your offline list/i)).toBeVisible();
+  await expect(picker).toHaveCount(0);
+  online = true;
+  await page.reload();
+  await picker.selectOption('11');
+  await expect(page.getByRole('button', { name: 'Paused', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'PAUSED' }] });
+  expect(fullReads).toBe(2);
+});
+
+test('can restore the displayed status after AniList saves an edit but its reply is lost', async ({ page }) => {
+  const writes: string[] = [];
+  await page.route('https://graphql.anilist.co/**', (route) => {
+    const { query, variables } = route.request().postDataJSON();
+    if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+    if (query.includes('MediaListCollection'))
+      return route.fulfill({
+        json: {
+          data: {
+            MediaListCollection: {
+              hasNextChunk: false,
+              lists: [{ entries: [entry(11, 'First title', 'CURRENT')] }],
+            },
+          },
+        },
+      });
+    writes.push(variables.status);
+    if (writes.length === 1) return route.abort('failed');
+    return route.fulfill({ json: { data: { SaveMediaListEntry: entry(11, 'First title', variables.status) } } });
+  });
+  await page.goto('/');
+  await page.getByLabel('Anime in your list').selectOption('11');
+  const watching = page.getByRole('button', { name: 'Watching', exact: true });
+  await expect(watching).toBeDisabled();
+  await page.getByRole('button', { name: 'Paused', exact: true }).click();
+  await expect(page.getByText(/Could not confirm/)).toBeVisible();
+  await watching.click();
+  await expect(page.getByText('Saved to AniList.', { exact: true })).toBeVisible();
+  await expect(watching).toBeDisabled();
+  expect(writes).toEqual(['PAUSED', 'CURRENT']);
 });
 
 test('keeps a title-specific storage warning until the offline list is actually repaired', async ({ page }) => {

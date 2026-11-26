@@ -47,7 +47,7 @@
           <button
             type="button"
             [attr.aria-pressed]="entry.status === choice.value"
-            [disabled]="!auth.viewer() || (edit?.pending ?? entry.status) === choice.value"
+            [disabled]="!auth.viewer() || !list.canSelectStatus(entry, choice.value)"
             (click)="list.changeStatus(entry.id, choice.value)"
           >
             {{ choice.label }} @if (edit?.pending === choice.value) {

@@ -1,4 +1,4 @@
-import { Injectable, effect, inject, signal, untracked } from '@angular/core';
+import { Injectable, computed, effect, inject, signal, untracked } from '@angular/core';
 import { App } from '@capacitor/app';
 
 import { UnauthorizedError } from '../auth/anilist-viewer';
@@ -29,7 +29,7 @@ export class ListService {
   private readonly auth = inject(AuthService);
   private readonly store = inject(ListStore);
   private fetchFn: typeof fetch = (...args) => fetch(...args);
-  private cache: CachedList | null = null;
+  private readonly cache = signal<CachedList | null>(null);
   private loaded = false;
   private running: Promise<void> = Promise.resolve();
   private queuedReads = 0;
@@ -40,7 +40,12 @@ export class ListService {
   /** Bumped on sign-out, so a refresh that finishes afterwards does not save the old user's list. */
   private generation = 0;
 
-  readonly entries = signal<ListEntry[] | null>(null);
+  readonly entries = computed(() => {
+    const cache = this.cache();
+    const viewer = this.auth.viewer();
+    if (!cache || !cache.sessionId || cache.sessionId !== this.auth.sessionId()) return null;
+    return !viewer || viewer.id === cache.userId ? cache.entries : null;
+  });
   /** When the list was last fetched in full (device time, ms), or null: the 30-day clock, not "updated …". */
   readonly fetchedAt = signal<number | null>(null);
   /** When the list was last fetched in full or checked for changes (device time, ms), or null. */
@@ -55,13 +60,17 @@ export class ListService {
   readonly now = signal(Date.now());
 
   constructor() {
+    let lastSession: string | undefined;
     effect(() => {
       const status = this.auth.status();
       const viewer = this.auth.viewer();
+      const session = this.auth.sessionId();
       untracked(() => {
-        if (status === 'signedOut') {
+        if (status === 'signedOut' || (lastSession && lastSession !== session)) {
           void this.clear();
-        } else if (status === 'signedIn') {
+        }
+        lastSession = session;
+        if (status === 'signedIn') {
           void this.sync(viewer?.id ?? null);
         }
       });
@@ -102,17 +111,23 @@ export class ListService {
     });
   }
 
+  /** A lost reply leaves even the displayed choice available for an explicit undo. */
+  canSelectStatus(entry: ListEntry, status: ListStatus): boolean {
+    const pending = this.statusEdits().get(entry.id)?.pending;
+    if (pending) return status !== pending;
+    return status !== entry.status || this.unconfirmedWrites.has(entry.media.id);
+  }
+
   /** Taps on one title coalesce. Confirmed writes and refreshes use the same serial queue. */
   async changeStatus(id: number, status: ListStatus): Promise<void> {
     const userId = this.auth.viewer()?.id;
     const token = this.auth.accessToken();
-    const entry = this.cache?.entries.find((item) => item.id === id);
-    if (!entry || !userId || !token || this.cache?.userId !== userId || this.auth.status() !== 'signedIn') {
+    const entry = this.cache()?.entries.find((item) => item.id === id);
+    if (!entry || !userId || !token || this.cache()?.userId !== userId || this.auth.status() !== 'signedIn') {
       return;
     }
     const mediaId = entry.media.id;
-    const previous = this.statusEdits().get(id);
-    if (status === (previous?.pending ?? entry.status)) {
+    if (!this.canSelectStatus(entry, status)) {
       return;
     }
     const returnsToDisplayedStatus = status === entry.status;
@@ -136,7 +151,7 @@ export class ListService {
         this.setStatusEdit(id, null);
         return;
       }
-      const cache = this.cache;
+      const cache = this.cache();
       const existing = cache?.entries.find((item) => item.id === id);
       if (!cache || cache.userId !== userId || existing?.media.id !== mediaId) {
         const replaced = cache?.entries.some((item) => item.media.id === mediaId);
@@ -195,7 +210,7 @@ export class ListService {
           const message =
             error instanceof RateLimitedError
               ? 'AniList is busy. Try again in a minute.'
-              : 'Could not confirm the change. Refresh your list and try again.';
+              : 'Could not confirm the change. Choose a status again or refresh your list.';
           this.setStatusEdit(id, { mediaId, pending: null, problem: true, message });
         }
       } finally {
@@ -220,34 +235,43 @@ export class ListService {
    */
   async sync(viewerId: number | null, now = Date.now()): Promise<void> {
     const generation = this.generation;
+    const sessionId = this.auth.sessionId();
     await this.runRead(async () => {
-      if (generation !== this.generation) {
-        return;
-      }
+      if (generation !== this.generation || sessionId !== this.auth.sessionId()) return;
+      let cache = this.cache();
       if (!this.loaded) {
         const saved = await this.store.read();
-        if (generation !== this.generation) {
-          return;
+        if (generation !== this.generation || sessionId !== this.auth.sessionId()) return;
+        const sameOwner = viewerId !== null && saved?.userId === viewerId;
+        const sameSession = !!sessionId && saved?.sessionId === sessionId;
+        cache = sameOwner || (viewerId === null && sameSession) ? saved : null;
+        this.loaded = cache !== null || viewerId !== null;
+        if (cache && sameOwner && !sameSession) {
+          cache = { ...cache, sessionId };
+          await this.save(cache, []);
+        } else {
+          this.show(cache);
         }
-        this.loaded = true;
-        this.show(saved);
+        if (saved && !cache && viewerId !== null) await this.store.delete();
       }
       if (viewerId === null) {
-        return; // Offline: keep showing the saved copy; the refresh waits until AniList answers.
+        if (!cache && this.store.needsRefresh) this.message.set('Reconnect and refresh to restore your offline list.');
+        return;
       }
-      if (this.cache && this.cache.userId !== viewerId) {
+      if (cache && cache.userId !== viewerId) {
         this.unconfirmedWrites.clear();
         this.statusEdits.set(new Map());
         this.unsavedMediaIds.set(new Set());
         this.show(null);
+        cache = null;
         await this.store.delete();
       }
-      const age = this.cache ? now - this.cache.fetchedAt : Infinity;
+      const age = cache ? now - cache.fetchedAt : Infinity;
       if (age >= LIST_TTL_MS || age < 0) {
         await this.fetchAndSave(viewerId, now, generation);
         return;
       }
-      const sinceCheck = now - (this.cache?.checkedAt ?? 0);
+      const sinceCheck = now - (this.cache()?.checkedAt ?? 0);
       if (sinceCheck >= CHANGES_INTERVAL_MS || sinceCheck < 0) {
         await this.checkChanges(viewerId, now, generation);
       }
@@ -294,6 +318,7 @@ export class ListService {
     if (!token || generation !== this.generation) {
       return;
     }
+    const sessionId = this.auth.sessionId();
     this.refreshing.set(true);
     this.message.set(null);
     try {
@@ -305,11 +330,10 @@ export class ListService {
       };
       const options = userAsked ? { retry: true, onWait } : {};
       const entries = await fetchList(token, userId, this.fetchFn, undefined, options);
-      if (generation !== this.generation) {
-        return;
-      }
+      if (generation !== this.generation || sessionId !== this.auth.sessionId()) return;
       const list: CachedList = {
         version: CACHE_VERSION,
+        sessionId,
         userId,
         fetchedAt: now,
         checkedAt: now,
@@ -332,7 +356,7 @@ export class ListService {
    * The user did not ask for it, so a failure stays quiet (the next start or resume tries again); 401 still signs out.
    */
   private async checkChanges(userId: number, now: number, generation: number): Promise<void> {
-    const cache = this.cache;
+    const cache = this.cache();
     const token = this.auth.accessToken(now);
     if (!cache || !token || generation !== this.generation) {
       return;
@@ -340,7 +364,7 @@ export class ListService {
     this.refreshing.set(true);
     try {
       const changed = await fetchChanges(token, userId, cache.watermark, this.fetchFn);
-      if (generation !== this.generation || this.cache !== cache) {
+      if (generation !== this.generation || this.cache() !== cache) {
         return; // Signed out meanwhile.
       }
       if (changed !== null) {
@@ -379,7 +403,7 @@ export class ListService {
     }
     // A read can satisfy a pending tap before dispatch. Only count a change to the same list entry.
     const edits = this.statusEdits();
-    for (const before of this.cache?.entries ?? []) {
+    for (const before of this.cache()?.entries ?? []) {
       const after = checked.get(before.media.id);
       const edit = edits.get(before.id);
       if (
@@ -403,10 +427,13 @@ export class ListService {
     this.show(list);
     try {
       await this.store.write(list);
-      if (this.cache === list && this.unsavedMediaIds().size) this.unsavedMediaIds.set(new Set());
+      if (this.cache() === list && this.unsavedMediaIds().size) this.unsavedMediaIds.set(new Set());
     } catch {
-      if (this.cache === list && editedMediaIds.length) {
-        this.unsavedMediaIds.update((ids) => new Set([...ids, ...editedMediaIds]));
+      if (this.cache() === list && editedMediaIds.length) {
+        await this.store.invalidate();
+        if (this.cache() === list) this.unsavedMediaIds.update((ids) => new Set([...ids, ...editedMediaIds]));
+      } else if (this.cache() === list && this.store.needsRefresh && !this.unsavedMediaIds().size) {
+        this.message.set('Could not save the refreshed list on this device. Pull down to try again.');
       }
     }
   }
@@ -421,7 +448,7 @@ export class ListService {
       this.message.set('AniList is busy right now. Try again in a minute.');
     } else {
       this.message.set(
-        this.cache
+        this.cache()
           ? 'Could not update your list. Showing the saved copy.'
           : 'Could not load your list. Pull down to try again.',
       );
@@ -429,8 +456,7 @@ export class ListService {
   }
 
   private show(list: CachedList | null): void {
-    this.cache = list;
-    this.entries.set(list?.entries ?? null);
+    this.cache.set(list);
     this.fetchedAt.set(list?.fetchedAt ?? null);
     this.checkedAt.set(list?.checkedAt ?? null);
   }

@@ -40,6 +40,23 @@ function fakeFetch(responses: { status: number; body: unknown }[]) {
 }
 
 describe('fetchList', () => {
+  it.each([
+    { ...page([raw(1)]), errors: [{ message: 'Group unavailable' }] },
+    { data: { MediaListCollection: { hasNextChunk: false, lists: null } } },
+    { data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: null }] } } },
+    { data: { MediaListCollection: { hasNextChunk: null, lists: [] } } },
+  ])('rejects an incomplete final chunk instead of returning the earlier rows', async (body) => {
+    const { fn } = fakeFetch([
+      { status: 200, body: page([raw(2)], true) },
+      { status: 200, body },
+    ]);
+    await expect(fetchList('tok', 7, fn, 0)).rejects.toThrow();
+  });
+
+  it('accepts a complete empty list', async () => {
+    const { fn } = fakeFetch([{ status: 200, body: page([]) }]);
+    await expect(fetchList('tok', 7, fn)).resolves.toEqual([]);
+  });
   it('reads the whole list in one call and maps the fields', async () => {
     const { fn, calls } = fakeFetch([{ status: 200, body: page([raw(1), raw(2)]) }]);
     const entries = await fetchList('tok', 7, fn);
@@ -150,6 +167,10 @@ function pagesFetch(pages: unknown[]) {
 }
 
 describe('fetchChanges', () => {
+  it('rejects a partial changes page instead of advancing the watermark', async () => {
+    const { fn } = pagesFetch([{ ...changesPage([raw(1, 300)]), errors: [{ message: 'Partial page' }] }]);
+    await expect(fetchChanges('tok', 7, 200, fn, 0)).rejects.toThrow();
+  });
   it('returns the entries changed since the watermark, the same second included, and stops at the first older one', async () => {
     const { fn, asked } = pagesFetch([
       changesPage([raw(1, 300), raw(2, 200), raw(3, 200), raw(4, 199), raw(5, 400)], true),

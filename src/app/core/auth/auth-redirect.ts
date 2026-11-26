@@ -2,6 +2,8 @@ import { ANILIST } from './anilist.config';
 
 export interface StoredToken {
   accessToken: string;
+  /** Random local identifier for an offline list verified during this sign-in. */
+  sessionId?: string;
   /** Epoch milliseconds. */
   expiresAt: number;
 }
