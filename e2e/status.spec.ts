@@ -1,4 +1,21 @@
-import { expect, test } from '@playwright/test';
+import { Directory, Encoding, type FilesystemPlugin } from '@capacitor/filesystem';
+import { expect, test, type Page } from '@playwright/test';
+
+declare global {
+  interface Window {
+    Capacitor: { Plugins: { Filesystem: FilesystemPlugin } };
+  }
+}
+
+function readOfflineList(page: Page) {
+  return page.evaluate(
+    async (options) => {
+      const file = await window.Capacitor.Plugins.Filesystem.readFile(options).catch(() => null);
+      return file ? JSON.parse(String(file.data)) : null;
+    },
+    { path: 'anilist-list.json', directory: Directory.LibraryNoCloud, encoding: Encoding.UTF8 },
+  );
+}
 
 test.beforeEach(async ({ page }) => {
   // Restore the session through the web storage adapter in this isolated browser context.
@@ -162,16 +179,82 @@ test('explains how to enable editing after an offline start and enables it on pu
   const picker = page.getByLabel('Anime in your list');
   await picker.selectOption('11');
   await expect(page.getByRole('button', { name: 'Paused' })).toBeEnabled();
+  // Rendering precedes the final file rename. Read the same offline file the next launch will open.
+  await expect.poll(() => readOfflineList(page)).toMatchObject({ userId: 5, entries: [{ id: 11, status: 'CURRENT' }] });
   online = false;
   await page.reload();
   await picker.selectOption('11');
   const hint = page.getByText(/Reconnect.*pull down to refresh/i);
   await expect(hint).toBeVisible();
   await expect(page.locator('fieldset button:disabled')).toHaveCount(6);
+  await expect(page.getByRole('button', { name: 'Watching', exact: true })).toHaveAttribute('aria-pressed', 'true');
   online = true;
   const readsBeforeRefresh = viewerReads;
   await page.locator('ion-refresher').dispatchEvent('ionRefresh');
   await expect(page.getByRole('button', { name: 'Paused' })).toBeEnabled();
   expect(viewerReads).toBe(readsBeforeRefresh + 1);
   await expect(hint).toHaveCount(0);
+});
+
+test('keeps a title-specific storage warning until the offline list is actually repaired', async ({ page }) => {
+  const rows = [entry(11, 'First title', 'CURRENT'), entry(22, 'Second title', 'CURRENT')];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const writes: number[] = [];
+  await page.route('https://graphql.anilist.co/**', async (route) => {
+    const { query, variables } = route.request().postDataJSON();
+    if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+    if (query.includes('MediaListCollection'))
+      return route.fulfill({
+        json: { data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: rows }] } } },
+      });
+    expect(query).toContain('SaveMediaListEntry');
+    writes.push(variables.id);
+    await held;
+    const row = rows.find((item) => item.id === variables.id)!;
+    row.status = variables.status;
+    return route.fulfill({ json: { data: { SaveMediaListEntry: row } } });
+  });
+  await page.goto('/');
+  const picker = page.getByLabel('Anime in your list');
+  await picker.selectOption('11');
+  await expect
+    .poll(() => readOfflineList(page))
+    .toMatchObject({
+      entries: [
+        { id: 11, status: 'CURRENT' },
+        { id: 22, status: 'CURRENT' },
+      ],
+    });
+  // Fail only writes to the list file in this isolated browser. Reads still return the real offline copy.
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (value?.path?.endsWith('/anilist-list.json.tmp') && sessionStorage.getItem('disk-full')) {
+        throw new DOMException('Disk full', 'QuotaExceededError');
+      }
+      return put.call(this, value, key);
+    };
+    sessionStorage.setItem('disk-full', '1');
+  });
+  const button = (name: string) => page.getByRole('button', { name, exact: true });
+  await button('Paused').click();
+  await expect.poll(() => writes).toEqual([11]);
+  await button('Dropped').click();
+  await button('Paused').click();
+  await picker.selectOption('22');
+  release();
+  const warning = page.getByRole('alert').filter({ hasText: 'This device could not store' });
+  await expect(warning).toContainText('First title');
+  await expect
+    .poll(() => readOfflineList(page))
+    .toMatchObject({ entries: [{ status: 'CURRENT' }, { status: 'CURRENT' }] });
+  await page.evaluate(() => sessionStorage.removeItem('disk-full'));
+  await button('Completed').click();
+  await expect(button('Completed')).toHaveAttribute('aria-pressed', 'true');
+  await expect
+    .poll(() => readOfflineList(page))
+    .toMatchObject({ entries: [{ status: 'PAUSED' }, { status: 'COMPLETED' }] });
+  await expect(warning).toHaveCount(0);
+  expect(writes).toEqual([11, 22]);
 });

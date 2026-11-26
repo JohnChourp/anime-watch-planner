@@ -31,6 +31,7 @@ describe('HomePage list summary', () => {
       checkedAt: signal(noon - 60_000),
       refreshing: signal(false),
       statusEdits: signal(new Map()),
+      unsavedMediaIds: signal(new Set()),
       message: signal<string | null>(null),
       now: signal(noon),
       refresh: async () => undefined,

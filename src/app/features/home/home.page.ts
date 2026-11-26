@@ -35,10 +35,10 @@ export class HomePage {
   protected readonly editProblems = computed(() => {
     const problems = [];
     for (const [id, edit] of this.list.statusEdits()) {
-      if (edit.problemMediaId !== undefined) {
+      if (edit.problem) {
         problems.push({
           id,
-          title: this.titleLabels().get(id) ?? `Anime #${edit.problemMediaId}`,
+          title: this.titleLabels().get(edit.mediaId) ?? `Anime #${edit.mediaId}`,
           message: edit.message,
         });
       }
@@ -97,14 +97,14 @@ function pickerLabels(entries: ListEntry[]): Map<number, string> {
   const ambiguous = duplicates(qualified);
   const used = new Set(names.filter((name) => !namesakes.has(name)));
   return new Map(
-    entries.map(({ id, media }, i) => {
+    entries.map(({ media }, i) => {
       let label = qualified[i];
       if (namesakes.has(names[i])) {
         if (ambiguous.has(label) || label === names[i]) label += ` #${media.id}`;
         while (used.has(label)) label += ` #${media.id}`;
         used.add(label);
       }
-      return [id, label];
+      return [media.id, label];
     }),
   );
 }

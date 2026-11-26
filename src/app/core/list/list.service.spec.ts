@@ -438,16 +438,36 @@ describe('ListService', () => {
       expect(store.writes).toBe(0);
     });
 
-    it('cancels even after debounce if the shared gate has not dispatched the change', async () => {
-      await anilistGate.send(async () => new Response(null, { status: 429, headers: { 'Retry-After': '1' } }), '/', {});
-      const send = vi.fn(listFetch(500).fn);
-      list.useFetch(send);
-      const first = list.changeStatus(1, 'PAUSED');
-      await vi.waitFor(() => expect(list.statusEdits().get(1)?.message).toContain('Waiting'));
-      await Promise.all([first, list.changeStatus(1, 'CURRENT')]);
-      expect(send).not.toHaveBeenCalled();
-      expect(list.statusEdits().has(1)).toBe(false);
-    });
+    it.each([true, false])(
+      'only dispatches an edit still wanted after the rate limit resets (cancel: %s)',
+      async (cancel) => {
+        vi.useFakeTimers();
+        try {
+          await anilistGate.send(
+            async () => new Response(null, { status: 429, headers: { 'Retry-After': '1' } }),
+            '/',
+            {},
+          );
+          const send = vi.fn(async () =>
+            Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }),
+          );
+          list.useFetch(send);
+          const first = list.changeStatus(1, 'PAUSED');
+          await vi.advanceTimersByTimeAsync(250);
+          expect(list.statusEdits().get(1)?.message).toContain('Waiting');
+          await vi.advanceTimersByTimeAsync(749);
+          expect(send).not.toHaveBeenCalled();
+          if (cancel) await list.changeStatus(1, 'CURRENT');
+          await vi.advanceTimersByTimeAsync(1);
+          await first;
+          expect(send).toHaveBeenCalledTimes(cancel ? 0 : 1);
+          expect(store.saved?.entries[0].status).toBe(cancel ? 'CURRENT' : 'PAUSED');
+          if (cancel) expect(list.statusEdits().has(1)).toBe(false);
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
 
     it.each(['confirmed', 'confirmed after undo', 'lost'])(
       'sends the undo when the first request was dispatched and its reply is %s',
@@ -542,8 +562,99 @@ describe('ListService', () => {
       list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
       await list.changeStatus(1, 'PAUSED');
       expect(list.entries()?.[0].status).toBe('PAUSED');
-      expect(list.statusEdits().get(1)?.message).toContain('This device could not store');
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+      expect(list.unsavedMediaIds().has(1)).toBe(true);
     });
+
+    it.each([true, false])(
+      'keeps the result of the one dispatched request on a matching last tap (disk works: %s)',
+      async (stored) => {
+        let reply!: (response: Response) => void;
+        const send = vi.fn(() => new Promise<Response>((resolve) => (reply = resolve)));
+        list.useFetch(send);
+        if (!stored) vi.spyOn(store, 'write').mockRejectedValue(new Error('disk full'));
+        const first = list.changeStatus(1, 'PAUSED');
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        const middle = list.changeStatus(1, 'DROPPED');
+        const last = list.changeStatus(1, 'PAUSED');
+        reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+        await Promise.all([first, middle, last]);
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(list.entries()?.[0].status).toBe('PAUSED');
+        expect(store.saved?.entries[0].status).toBe(stored ? 'PAUSED' : 'CURRENT');
+        expect(list.unsavedMediaIds().has(1)).toBe(!stored);
+        expect(list.statusEdits().get(1)?.message).toBe(stored ? 'Saved to AniList.' : undefined);
+      },
+    );
+
+    it.each(['delta', 'full'])(
+      'retains a device warning across a failed %s save and clears it only when the whole file is written',
+      async (kind) => {
+        const write = vi.spyOn(store, 'write').mockRejectedValue(new Error('disk full'));
+        const confirmed = { ...entry(1, 70), status: 'PAUSED' };
+        list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: confirmed } }));
+        await list.changeStatus(1, 'PAUSED');
+        list.useFetch(listFetch(200, [confirmed, entry(2, 50)], [[confirmed]]).fn);
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        if (kind === 'delta') await list.sync(me.id, now);
+        else await list.refresh(now);
+        expect(list.unsavedMediaIds().has(1)).toBe(true);
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        write.mockRestore();
+        // The next delta only mentions title 2, but the file contains both titles.
+        list.useFetch(listFetch(200, [], [[entry(2, 85)]]).fn);
+        await list.sync(me.id, now + CHANGES_INTERVAL_MS);
+        expect(store.saved?.entries[0].status).toBe('PAUSED');
+        expect(list.unsavedMediaIds().size).toBe(0);
+      },
+    );
+
+    it('a successful edit on another title repairs the device copy without clearing an unrelated remote error', async () => {
+      const write = vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+      list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+      await list.changeStatus(1, 'PAUSED');
+      write.mockRestore();
+      list.useFetch(async () => Response.json({}, { status: 503 }));
+      await list.changeStatus(1, 'DROPPED');
+      expect(list.unsavedMediaIds().has(1)).toBe(true);
+      list.useFetch(async () =>
+        Response.json({ data: { SaveMediaListEntry: { ...entry(2, 80), status: 'COMPLETED' } } }),
+      );
+      await list.changeStatus(2, 'COMPLETED');
+      expect(list.unsavedMediaIds().size).toBe(0);
+      expect(list.statusEdits().get(1)?.message).toContain('Could not confirm');
+      expect(store.saved?.entries.map((item) => item.status)).toEqual(['PAUSED', 'COMPLETED']);
+    });
+
+    it.each(['edit', 'delta'])(
+      'retires an old-entry warning when the replacement is confirmed by a later %s',
+      async (action) => {
+        const replacement = entry(3, 70, 1);
+        const delta = listFetch(200, [], [[replacement]]);
+        list.useFetch(delta.fn);
+        const pending = list.changeStatus(1, 'PAUSED');
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        await list.sync(me.id, now);
+        await pending;
+        expect(delta.calls).toEqual(['changes']);
+        expect(list.statusEdits().get(1)?.message).toContain('replaced');
+        expect(list.entries()?.find((item) => item.id === 3)?.status).toBe('CURRENT');
+        if (action === 'delta') {
+          await list.sync(me.id, now + CHANGES_INTERVAL_MS);
+          expect(delta.calls).toEqual(['changes', 'changes']);
+        } else {
+          const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+            expect(JSON.parse(String(init?.body)).variables).toEqual({ id: 3, status: 'PAUSED' });
+            return Response.json({ data: { SaveMediaListEntry: { ...replacement, status: 'PAUSED' } } });
+          });
+          list.useFetch(send);
+          await list.changeStatus(3, 'PAUSED');
+          expect(send).toHaveBeenCalledTimes(1);
+          expect(list.statusEdits().get(3)?.message).toBe('Saved to AniList.');
+        }
+        expect(list.statusEdits().has(1)).toBe(false);
+      },
+    );
 
     it.each([1, 3])('clears only the settled error for the anime returned on resume (entry %i)', async (returnedId) => {
       list.useFetch(async () => {

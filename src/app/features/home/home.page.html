@@ -36,7 +36,7 @@
       >
         <option value="">Choose a title</option>
         @for (entry of entries; track entry.id) {
-        <option [value]="entry.id">{{ titleLabels().get(entry.id) }}</option>
+        <option [value]="entry.id">{{ titleLabels().get(entry.media.id) }}</option>
         }
       </select>
       @if (selected(); as entry) { @let edit = list.statusEdits().get(entry.id);
@@ -59,7 +59,7 @@
       </fieldset>
       <p class="feedback" role="status">
         @if (!auth.viewer()) { Reconnect, then pull down to refresh before changing this title. } @else if
-        (edit?.problemMediaId === undefined) { {{ edit?.message }} }
+        (!edit?.problem) { {{ edit?.message }} }
       </p>
       }
     </div>
@@ -67,6 +67,11 @@
     <p>Your AniList anime list is empty.</p>
     } @for (problem of editProblems(); track problem.id) {
     <p class="message" role="alert">{{ problem.title }} — {{ problem.message }}</p>
+    } @for (mediaId of list.unsavedMediaIds(); track mediaId) {
+    <p class="message" role="alert">
+      {{ titleLabels().get(mediaId) ?? ('Anime #' + mediaId) }} — Saved to AniList. This device could not store the
+      change.
+    </p>
     } }
     <ion-button class="action" fill="outline" (click)="auth.signOut()">Sign out</ion-button>
   </section>

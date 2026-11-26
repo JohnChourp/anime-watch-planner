@@ -60,6 +60,18 @@ describe('ListStore', () => {
     expect(fs.writeFile.mock.invocationCallOrder[0]).toBeLessThan(fs.rename.mock.invocationCallOrder[0]);
   });
 
+  it('reports a successful write only after the temporary file has its final offline name', async () => {
+    let finishRename!: () => void;
+    fs.rename.mockImplementationOnce(() => new Promise<void>((resolve) => (finishRename = resolve)));
+    const completed = vi.fn();
+    const writing = store.write(good).then(completed);
+    await vi.waitFor(() => expect(fs.rename).toHaveBeenCalledOnce());
+    expect(completed).not.toHaveBeenCalled();
+    finishRename();
+    await writing;
+    expect(completed).toHaveBeenCalledOnce();
+  });
+
   it('deletes only the files that are there', async () => {
     fs.readdir.mockResolvedValue({ files: [{ name: 'anilist-list.json' }] } as never);
     fs.deleteFile.mockResolvedValue();
