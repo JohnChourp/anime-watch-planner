@@ -587,6 +587,101 @@ describe('ListService', () => {
       },
     );
 
+    it.each(['CURRENT', 'PAUSED'])('honours the last tap after a queued refresh returns %s', async (remoteStatus) => {
+      let reply!: (response: Response) => void;
+      const writes: string[] = [];
+      let remote = 'CURRENT';
+      const reads = listFetch(200, [{ ...entry(1, 75), status: remoteStatus }]);
+      list.useFetch(async (url, init) => {
+        const { query, variables } = JSON.parse(String(init?.body));
+        if (!query.includes('SaveMediaListEntry')) {
+          remote = remoteStatus;
+          return reads.fn(url, init);
+        }
+        writes.push(variables.status);
+        remote = variables.status;
+        if (writes.length === 1) return new Promise<Response>((resolve) => (reply = resolve));
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 80), status: remote } } });
+      });
+      const first = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(writes).toEqual(['PAUSED']));
+      const refresh = list.refresh();
+      const middle = list.changeStatus(1, 'DROPPED');
+      const last = list.changeStatus(1, 'PAUSED');
+      reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+      await Promise.all([first, refresh, middle, last]);
+      expect(reads.calls).toEqual(['full']);
+      expect(writes).toEqual(remoteStatus === 'CURRENT' ? ['PAUSED', 'PAUSED'] : ['PAUSED']);
+      expect(remote).toBe('PAUSED');
+      expect(list.entries()?.[0].status).toBe('PAUSED');
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+    });
+
+    it('rechecks a return to the displayed status while a read is in flight', async () => {
+      let reply!: (response: Response) => void;
+      const writes: string[] = [];
+      list.useFetch(async (_url, init) => {
+        const { query, variables } = JSON.parse(String(init?.body));
+        if (!query.includes('SaveMediaListEntry')) return new Promise<Response>((resolve) => (reply = resolve));
+        writes.push(variables.status);
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 80), status: variables.status } } });
+      });
+      const refresh = list.refresh();
+      await vi.waitFor(() => expect(reply).toBeDefined());
+      const middle = list.changeStatus(1, 'DROPPED');
+      const last = list.changeStatus(1, 'CURRENT');
+      reply(
+        Response.json({
+          data: {
+            MediaListCollection: { hasNextChunk: false, lists: [{ entries: [{ ...entry(1, 75), status: 'PAUSED' }] }] },
+          },
+        }),
+      );
+      await Promise.all([refresh, middle, last]);
+      expect(writes).toEqual(['CURRENT']);
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+    });
+
+    it.each(['delta', 'full'])(
+      'warns only for edited titles first confirmed by a %s read that the device cannot save',
+      async (kind) => {
+        list.useFetch(async () => {
+          throw new TypeError('reply lost');
+        });
+        await list.changeStatus(1, 'PAUSED');
+        expect(list.statusEdits().get(1)?.problem).toBe(true);
+        const changes = [
+          { ...entry(1, 80), status: 'PAUSED' },
+          { ...entry(2, 75), status: 'DROPPED' },
+        ];
+        list.useFetch(listFetch(200, changes, [changes]).fn);
+        vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        if (kind === 'delta') await list.sync(me.id, now);
+        else await list.refresh(now);
+        expect(list.entries()?.[0].status).toBe('PAUSED');
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        expect(list.statusEdits().has(1)).toBe(false);
+        expect([...list.unsavedMediaIds()]).toEqual([1]);
+        await list.refresh(now);
+        expect(store.saved?.entries[0].status).toBe('PAUSED');
+        expect(list.unsavedMediaIds().size).toBe(0);
+      },
+    );
+
+    it('does not flag the offline copy when the read confirms the original status after a lost reply', async () => {
+      list.useFetch(async () => {
+        throw new TypeError('reply lost');
+      });
+      await list.changeStatus(1, 'PAUSED');
+      list.useFetch(listFetch(200).fn);
+      vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+      await list.refresh();
+      expect(list.entries()?.[0].status).toBe('CURRENT');
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(list.unsavedMediaIds().size).toBe(0);
+    });
+
     it.each(['delta', 'full'])(
       'retains a device warning across a failed %s save and clears it only when the whole file is written',
       async (kind) => {

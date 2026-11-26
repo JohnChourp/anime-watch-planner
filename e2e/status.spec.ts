@@ -211,6 +211,7 @@ test('keeps a title-specific storage warning until the offline list is actually 
     expect(query).toContain('SaveMediaListEntry');
     writes.push(variables.id);
     await held;
+    if (variables.status === 'DROPPED') return route.fulfill({ status: 503, json: {} });
     const row = rows.find((item) => item.id === variables.id)!;
     row.status = variables.status;
     return route.fulfill({ json: { data: { SaveMediaListEntry: row } } });
@@ -244,17 +245,26 @@ test('keeps a title-specific storage warning until the offline list is actually 
   await button('Paused').click();
   await picker.selectOption('22');
   release();
-  const warning = page.getByRole('alert').filter({ hasText: 'This device could not store' });
+  const warning = page.getByRole('alert').filter({ hasText: 'offline copy on this device' });
   await expect(warning).toContainText('First title');
+  await picker.selectOption('11');
+  await button('Dropped').click();
+  const remoteError = page.getByRole('alert').filter({ hasText: 'Could not confirm' });
+  await expect(remoteError).toContainText('First title');
+  await expect(warning).toBeVisible();
+  await expect(page.getByText('Saved to AniList.', { exact: false })).toHaveCount(0);
+  await expect(button('Paused')).toHaveAttribute('aria-pressed', 'true');
   await expect
     .poll(() => readOfflineList(page))
     .toMatchObject({ entries: [{ status: 'CURRENT' }, { status: 'CURRENT' }] });
   await page.evaluate(() => sessionStorage.removeItem('disk-full'));
+  await picker.selectOption('22');
   await button('Completed').click();
   await expect(button('Completed')).toHaveAttribute('aria-pressed', 'true');
   await expect
     .poll(() => readOfflineList(page))
     .toMatchObject({ entries: [{ status: 'PAUSED' }, { status: 'COMPLETED' }] });
   await expect(warning).toHaveCount(0);
-  expect(writes).toEqual([11, 22]);
+  await expect(remoteError).toContainText('First title');
+  expect(writes).toEqual([11, 11, 22]);
 });

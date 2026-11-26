@@ -69,8 +69,7 @@
     <p class="message" role="alert">{{ problem.title }} — {{ problem.message }}</p>
     } @for (mediaId of list.unsavedMediaIds(); track mediaId) {
     <p class="message" role="alert">
-      {{ titleLabels().get(mediaId) ?? ('Anime #' + mediaId) }} — Saved to AniList. This device could not store the
-      change.
+      {{ titleLabels().get(mediaId) ?? ('Anime #' + mediaId) }} — The offline copy on this device may be out of date.
     </p>
     } }
     <ion-button class="action" fill="outline" (click)="auth.signOut()">Sign out</ion-button>
