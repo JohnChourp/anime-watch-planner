@@ -17,18 +17,29 @@ function readOfflineList(page: Page) {
   );
 }
 
-async function simulateFullDisk(page: Page) {
-  // Fail only writes to the list file in this browser. Reads still see the real offline copy.
-  await page.evaluate(() => {
+async function simulateFullDisk(page: Page, readOnly = false) {
+  // Keep reads real; optionally deny the marker and deletion as well as the list write.
+  await page.evaluate((readOnly) => {
     const put = IDBObjectStore.prototype.put;
     IDBObjectStore.prototype.put = function (value, key) {
-      if (value?.path?.endsWith('/anilist-list.json.tmp') && sessionStorage.getItem('disk-full')) {
+      if (
+        (value?.path?.endsWith('/anilist-list.json.tmp') ||
+          (readOnly && value?.path?.endsWith('/anilist-list.stale'))) &&
+        sessionStorage.getItem('disk-full')
+      ) {
         throw new DOMException('Disk full', 'QuotaExceededError');
       }
       return put.call(this, value, key);
     };
+    const remove = IDBObjectStore.prototype.delete;
+    IDBObjectStore.prototype.delete = function (key) {
+      if (readOnly && String(key).endsWith('/anilist-list.json') && sessionStorage.getItem('disk-full')) {
+        throw new DOMException('Read only', 'ReadOnlyError');
+      }
+      return remove.call(this, key);
+    };
     sessionStorage.setItem('disk-full', '1');
-  });
+  }, readOnly);
 }
 
 test.beforeEach(async ({ page }) => {
@@ -341,6 +352,73 @@ test('restores the confirmed status on restart even while the old offline file i
   await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'PAUSED' }] });
   expect(fullReads).toBe(2);
 });
+
+for (const interruption of [
+  'lost reply',
+  'storage unavailable before sending',
+  'storage unavailable after sending',
+] as const) {
+  test(`restores the correct status after restart with ${interruption}`, async ({ page }) => {
+    let status = 'CURRENT';
+    let reads = 0;
+    const writes: string[] = [];
+    await page.route('https://graphql.anilist.co/**', async (route) => {
+      const { query, variables } = route.request().postDataJSON();
+      if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+      if (query.includes('MediaListCollection')) {
+        reads++;
+        return route.fulfill({
+          json: {
+            data: {
+              MediaListCollection: {
+                hasNextChunk: false,
+                lists: [{ entries: [entry(11, 'First title', status)] }],
+              },
+            },
+          },
+        });
+      }
+      expect(query).toContain('SaveMediaListEntry');
+      const protectedOnDisk = await page.evaluate(async (directory) => {
+        const { files } = await window.Capacitor.Plugins.Filesystem.readdir({ directory, path: '' });
+        return files.some((file) => file.name === 'anilist-list.stale');
+      }, Directory.LibraryNoCloud);
+      expect(protectedOnDisk).toBe(true);
+      writes.push(variables.status);
+      status = variables.status;
+      if (interruption === 'lost reply') return route.abort('failed');
+      if (interruption === 'storage unavailable after sending') await simulateFullDisk(page, true);
+      return route.fulfill({ json: { data: { SaveMediaListEntry: entry(11, 'First title', status) } } });
+    });
+    const picker = page.getByLabel('Anime in your list');
+    const button = (name: string) => page.getByRole('button', { name, exact: true });
+    await page.goto('/');
+    await picker.selectOption('11');
+    await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'CURRENT' }] });
+    const blocked = interruption === 'storage unavailable before sending';
+    if (blocked) await simulateFullDisk(page, true);
+    await button('Paused').click();
+    const notice = blocked
+      ? /No change was sent/
+      : interruption === 'lost reply'
+        ? /Could not confirm/
+        : /offline copy on this device/;
+    await expect(page.getByRole('alert').filter({ hasText: notice })).toBeVisible();
+    expect(writes).toEqual(blocked ? [] : ['PAUSED']);
+    expect(await readOfflineList(page)).toMatchObject({ entries: [{ status: 'CURRENT' }] });
+    await page.reload();
+    await picker.selectOption('11');
+    await expect(button(blocked ? 'Watching' : 'Paused')).toHaveAttribute('aria-pressed', 'true');
+    expect(reads).toBe(blocked ? 1 : 2);
+    if (blocked) {
+      // The device can save again after the restart. Only an explicit tap sends the change.
+      await button('Paused').click();
+      await expect(page.getByText('Saved to AniList.', { exact: true })).toBeVisible();
+    }
+    await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'PAUSED' }] });
+    expect(writes).toEqual(['PAUSED']);
+  });
+}
 
 test('can restore the displayed status after AniList saves an edit but its reply is lost', async ({ page }) => {
   const writes: string[] = [];

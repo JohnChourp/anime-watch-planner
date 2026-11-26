@@ -82,7 +82,7 @@ export class ListService {
   /** Back from the background: refresh the clock, then check the list (30 days old, or 15 minutes since a check). */
   resume(now = Date.now()): void {
     this.now.set(now);
-    if (this.auth.status() === 'signedIn') {
+    if (this.auth.status() === 'signedIn' && this.auth.accessToken(now)) {
       void this.sync(this.auth.viewer()?.id ?? null, now);
     }
   }
@@ -172,7 +172,16 @@ export class ListService {
       }
       // The shared gate may wait before dispatch. A newer tap or a sign-out cancels a still-unsent write.
       const alreadyUnconfirmed = this.unconfirmedWrites.has(mediaId);
-      const send: typeof fetch = (url, init) => {
+      const wasMarked = this.store.needsRefresh;
+      let storageBlocked = false;
+      const send: typeof fetch = async (url, init) => {
+        if (!current() || !sameSession()) throw new Error('Status change cancelled.');
+        try {
+          await this.store.markBeforeEdit();
+        } catch (error) {
+          storageBlocked = true;
+          throw error;
+        }
         if (!current() || !sameSession()) throw new Error('Status change cancelled.');
         this.unconfirmedWrites.set(mediaId, existing.status);
         return this.fetchFn(url, init);
@@ -204,11 +213,17 @@ export class ListService {
       } catch (error) {
         if (!sameSession()) return;
         if (error instanceof RateLimitedError && !alreadyUnconfirmed) this.unconfirmedWrites.delete(mediaId);
+        // A cancelled dispatch or a definite refusal leaves the previous offline file valid.
+        if (!wasMarked && this.store.needsRefresh && !this.unconfirmedWrites.size && !this.unsavedMediaIds().size) {
+          await this.store.clearMarker().catch(() => undefined); // If removal fails, the next launch rechecks.
+        }
+        if (!sameSession()) return;
         if (error instanceof UnauthorizedError) {
           await this.auth.expire();
         } else if (current()) {
-          const message =
-            error instanceof RateLimitedError
+          const message = storageBlocked
+            ? 'No change was sent. Check device storage and try again.'
+            : error instanceof RateLimitedError
               ? 'AniList is busy. Try again in a minute.'
               : 'Could not confirm the change. Choose a status again or refresh your list.';
           this.setStatusEdit(id, { mediaId, pending: null, problem: true, message });
@@ -426,11 +441,16 @@ export class ListService {
   private async save(list: CachedList, editedMediaIds: readonly number[]): Promise<void> {
     this.show(list);
     try {
-      await this.store.write(list);
+      await this.store.write(list, this.unconfirmedWrites.size > 0);
       if (this.cache() === list && this.unsavedMediaIds().size) this.unsavedMediaIds.set(new Set());
     } catch {
       if (this.cache() === list && editedMediaIds.length) {
-        await this.store.invalidate();
+        try {
+          await this.store.invalidate();
+        } catch {
+          if (this.cache() === list)
+            this.message.set('Device storage is unavailable. Reconnect and refresh your list.');
+        }
         if (this.cache() === list) this.unsavedMediaIds.update((ids) => new Set([...ids, ...editedMediaIds]));
       } else if (this.cache() === list && this.store.needsRefresh && !this.unsavedMediaIds().size) {
         this.message.set('Could not save the refreshed list on this device. Pull down to try again.');

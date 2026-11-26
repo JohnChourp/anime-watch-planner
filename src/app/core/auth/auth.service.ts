@@ -15,6 +15,7 @@ export class AuthService {
   private readonly platform = inject(AuthPlatform);
   private fetchFn: typeof fetch = (...args) => fetch(...args);
   private readonly token = signal<StoredToken | null>(null);
+  private deletingToken: Promise<void> | null = null;
   private started = false;
 
   readonly status = signal<AuthStatus>('loading');
@@ -53,9 +54,8 @@ export class AuthService {
       await this.expire();
     } else if (saved) {
       if (!saved.sessionId) {
-        // Upgrade older sessions without discarding a valid sign-in if secure storage is full.
-        saved = { ...saved, sessionId: crypto.randomUUID() };
-        await this.platform.writeToken(saved).catch(() => undefined);
+        // A stable, local-only cache identifier. Never replace a valid legacy Keychain item during migration.
+        saved = { ...saved, sessionId: await legacySessionId(saved.accessToken) };
       }
       this.token.set(saved);
       this.status.set('signedIn');
@@ -130,6 +130,7 @@ export class AuthService {
     }
     const token = { ...result.token, sessionId: crypto.randomUUID() };
     try {
+      if (this.deletingToken) await this.deletingToken.catch(() => undefined);
       await this.platform.writeToken(token);
     } catch {
       this.status.set('signedOut');
@@ -145,20 +146,22 @@ export class AuthService {
 
   /** Signs out on this device: forgets the token. ListService sees the status change and deletes the saved list. */
   async signOut(): Promise<void> {
-    try {
-      await this.platform.deleteToken();
-    } finally {
-      this.token.set(null);
-      this.viewer.set(null);
-      this.message.set(null);
-      this.status.set('signedOut');
-    }
+    if (this.deletingToken) return this.deletingToken;
+    this.token.set(null);
+    this.viewer.set(null);
+    this.message.set(null);
+    this.status.set('loading');
+    this.deletingToken = this.platform.deleteToken().finally(() => {
+      this.deletingToken = null;
+      if (!this.token()) this.status.set('signedOut');
+    });
+    return this.deletingToken;
   }
 
   /** Any AniList call that gets a 401 calls this: the user signs in again, with a clear message. */
   async expire(): Promise<void> {
     await this.signOut().catch(() => undefined);
-    this.message.set('Your AniList session has ended. Please sign in again.');
+    if (this.status() === 'signedOut') this.message.set('Your AniList session has ended. Please sign in again.');
   }
 
   /** Asks AniList who is signed in; the list refresh calls it again when the first try was offline. */
@@ -177,4 +180,16 @@ export class AuthService {
       // Offline or AniList down: stay signed in; the name shows up next time.
     }
   }
+}
+
+async function legacySessionId(accessToken: string): Promise<string> {
+  let bytes: Uint8Array;
+  try {
+    const input = new TextEncoder().encode('anime-watch-planner/offline-list/' + accessToken);
+    bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', input));
+  } catch {
+    // Keep the valid sign-in even when a WebView cannot derive a stable offline identifier.
+    bytes = crypto.getRandomValues(new Uint8Array(32));
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }

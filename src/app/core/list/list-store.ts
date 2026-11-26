@@ -24,18 +24,27 @@ export interface CachedList {
 const FILE = 'anilist-list.json';
 const TEMP = 'anilist-list.json.tmp';
 const STALE = 'anilist-list.stale';
+// A refresh can confirm a queued tap before it sends. If the files are read-only,
+// the WebView can still flag the old copy without storing any account or list data.
+const STALE_FALLBACK = 'anilist.list-needs-refresh';
 /** App-private files with no cloud backup: iOS Library (excluded from iCloud), Android app files. */
 const DIR = Directory.LibraryNoCloud;
 
 /** The list cache as one JSON file on the device. A thin wrapper, so ListService can be tested without one. */
 @Injectable({ providedIn: 'root' })
 export class ListStore {
-  needsRefresh = false;
+  private marked: boolean | undefined;
+  private fallbackMarked = false;
+
+  get needsRefresh(): boolean {
+    return this.marked === true || this.fallbackMarked;
+  }
 
   async read(): Promise<CachedList | null> {
     try {
       const { files } = await Filesystem.readdir({ path: '', directory: DIR });
-      this.needsRefresh = files.some((file) => file.name === STALE);
+      this.marked = files.some((file) => file.name === STALE);
+      this.fallbackMarked = !!localStorage.getItem(STALE_FALLBACK);
       if (this.needsRefresh) return null;
       const file = await Filesystem.readFile({ path: FILE, directory: DIR, encoding: Encoding.UTF8 });
       const value = JSON.parse(String(file.data)) as Partial<CachedList>;
@@ -58,7 +67,8 @@ export class ListStore {
   }
 
   /** Writes a temporary file, then renames it, so a crash mid-write never leaves half a list. */
-  async write(list: CachedList): Promise<void> {
+  async write(list: CachedList, keepMarker = false): Promise<void> {
+    if (keepMarker) await this.markBeforeEdit();
     await Filesystem.writeFile({
       path: TEMP,
       directory: DIR,
@@ -67,21 +77,41 @@ export class ListStore {
       recursive: true,
     });
     await Filesystem.rename({ from: TEMP, to: FILE, directory: DIR, toDirectory: DIR });
-    if (this.needsRefresh) {
+    if (!keepMarker) await this.clearMarker();
+  }
+
+  /** Must be durable before dispatch: a lost reply or a crash can leave the disk snapshot behind. */
+  async markBeforeEdit(): Promise<void> {
+    if (this.marked) return;
+    await Filesystem.writeFile({ path: STALE, directory: DIR, data: '1', encoding: Encoding.UTF8 });
+    this.marked = true;
+  }
+
+  async clearMarker(): Promise<void> {
+    if (this.marked === undefined) {
       const { files } = await Filesystem.readdir({ path: '', directory: DIR });
-      if (files.some((file) => file.name === STALE)) await Filesystem.deleteFile({ path: STALE, directory: DIR });
-      this.needsRefresh = false;
+      this.marked = files.some((file) => file.name === STALE);
+    }
+    if (this.marked) await Filesystem.deleteFile({ path: STALE, directory: DIR });
+    this.marked = false;
+    if (this.fallbackMarked) {
+      localStorage.removeItem(STALE_FALLBACK);
+      this.fallbackMarked = false;
     }
   }
 
   /** A confirmed edit missed the offline file. Never restore that file as fresh on the next launch. */
   async invalidate(): Promise<void> {
-    this.needsRefresh = true;
     try {
-      await Filesystem.writeFile({ path: STALE, directory: DIR, data: '1', encoding: Encoding.UTF8 });
+      await this.markBeforeEdit();
     } catch {
       // Even a tiny marker can fail on a full disk. Discard the old file in that case.
-      await Filesystem.deleteFile({ path: FILE, directory: DIR }).catch(() => undefined);
+      try {
+        await Filesystem.deleteFile({ path: FILE, directory: DIR });
+      } catch {
+        localStorage.setItem(STALE_FALLBACK, '1');
+        this.fallbackMarked = true;
+      }
     }
   }
 
@@ -93,7 +123,7 @@ export class ListStore {
     for (const path of [FILE, TEMP, STALE].filter((name) => names.includes(name))) {
       await Filesystem.deleteFile({ path, directory: DIR }).catch(() => undefined);
     }
-    this.needsRefresh = false;
+    this.marked = undefined;
   }
 }
 

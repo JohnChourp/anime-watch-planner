@@ -3,6 +3,7 @@ import { TestBed } from '@angular/core/testing';
 
 import { anilistGate } from '../anilist/anilist-gate';
 import type { Viewer } from '../auth/anilist-viewer';
+import { AuthPlatform } from '../auth/auth-platform';
 import type { AuthStatus } from '../auth/auth.service';
 import { AuthService } from '../auth/auth.service';
 
@@ -37,9 +38,15 @@ class FakeStore {
   async read() {
     return this.needsRefresh ? null : this.saved;
   }
-  async write(list: CachedList) {
+  async write(list: CachedList, keepMarker = false) {
     this.writes++;
     this.saved = list;
+    this.needsRefresh = keepMarker;
+  }
+  async markBeforeEdit() {
+    this.needsRefresh = true;
+  }
+  async clearMarker() {
     this.needsRefresh = false;
   }
   async invalidate() {
@@ -503,6 +510,45 @@ describe('ListService', () => {
       expect(send).toHaveBeenCalledTimes(2);
     });
 
+    it('keeps recovery pending across an unrelated edit and a delta that omits the uncertain title', async () => {
+      list.useFetch(async (_, init) => {
+        const { id, status } = JSON.parse(String(init?.body)).variables;
+        if (id === 1) throw new Error('Lost reply');
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(id, 110), status } } });
+      });
+      await list.changeStatus(1, 'PAUSED');
+      expect(store.needsRefresh).toBe(true);
+      await list.changeStatus(2, 'COMPLETED');
+      expect(store.needsRefresh).toBe(true);
+      list.useFetch(listFetch(200).fn);
+      await list.sync(me.id, store.saved!.checkedAt + CHANGES_INTERVAL_MS);
+      expect(store.needsRefresh).toBe(true);
+      list.useFetch(
+        listFetch(200, [
+          { ...entry(1, 105), status: 'PAUSED' },
+          { ...entry(2, 110), status: 'COMPLETED' },
+        ]).fn,
+      );
+      await list.refresh();
+      expect(store.needsRefresh).toBe(false);
+      expect(store.saved?.entries.map((row) => row.status)).toEqual(['PAUSED', 'COMPLETED']);
+    });
+
+    it('retains a clean offline copy when local protection fails before dispatch', async () => {
+      vi.spyOn(store, 'markBeforeEdit').mockRejectedValueOnce(new Error('read-only storage'));
+      const send = vi.fn(async () =>
+        Response.json({ data: { SaveMediaListEntry: { ...entry(1, 90), status: 'PAUSED' } } }),
+      );
+      list.useFetch(send);
+      await list.changeStatus(1, 'PAUSED');
+      expect(send).not.toHaveBeenCalled();
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+      expect(list.statusEdits().get(1)?.message).toContain('No change was sent');
+      await list.changeStatus(1, 'PAUSED');
+      expect(send).toHaveBeenCalledOnce();
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+    });
+
     it.each([true, false])(
       'only dispatches an edit still wanted after the rate limit resets (cancel: %s)',
       async (cancel) => {
@@ -946,5 +992,85 @@ describe('ListService', () => {
       expect(store.saved?.entries[0].status).toBe('DROPPED');
       expect(list.statusEdits().get(1)?.pending).toBe(null);
     });
+  });
+});
+
+describe('ListService with the device session', () => {
+  const now = 5_000_000_000;
+  const expiresAt = now + 60_000;
+  let auth: AuthService;
+  let list: ListService;
+  let store: FakeStore;
+  let finishDeletion: () => void;
+
+  beforeEach(() => {
+    store = new FakeStore();
+    store.saved = saved(7, now);
+    const platform = {
+      onRedirect: async () => undefined,
+      onSignInClosed: async () => undefined,
+      launchUrl: async () => null,
+      readToken: async () => ({ accessToken: 'local-test-session', sessionId: 'test-session', expiresAt }),
+      deleteToken: () =>
+        new Promise<void>((resolve) => {
+          finishDeletion = resolve;
+        }),
+    };
+    TestBed.configureTestingModule({
+      providers: [
+        { provide: AuthPlatform, useValue: platform },
+        { provide: ListStore, useValue: store },
+      ],
+    });
+    auth = TestBed.inject(AuthService);
+    list = TestBed.inject(ListService);
+  });
+
+  it('checks local expiry on resume before showing the offline list, without contacting AniList', async () => {
+    const offline = vi.fn(async () => {
+      throw new Error('offline');
+    });
+    auth.useFetch(offline);
+    list.useFetch(offline);
+    await auth.start(now);
+    await list.sync(null, now);
+    expect(list.entries()).toHaveLength(2);
+    list.resume(expiresAt - 1);
+    expect(list.entries()).toHaveLength(2);
+    list.resume(expiresAt);
+    expect(list.entries()).toBeNull();
+    expect(auth.accessToken(expiresAt)).toBeNull();
+    expect(offline).toHaveBeenCalledTimes(1); // Initial viewer check only.
+    finishDeletion();
+    await vi.waitFor(() => expect(auth.status()).toBe('signedOut'));
+  });
+
+  it('cancels a queued edit on sign-out even while native credential deletion is unfinished', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    let allowDispatch!: () => void;
+    const preparation = vi.spyOn(store, 'markBeforeEdit').mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          allowDispatch = resolve;
+        }),
+    );
+    const send = vi.fn(async () => Response.json({}));
+    list.useFetch(send);
+    auth.useFetch(async () => Response.json({ data: { Viewer: { id: 7, name: 'Demo' } } }));
+    try {
+      await auth.start(now);
+      await list.sync(7, now);
+      const edit = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(preparation).toHaveBeenCalledOnce());
+      const leaving = auth.signOut();
+      allowDispatch();
+      await edit;
+      expect(send).not.toHaveBeenCalled();
+      expect(list.entries()).toBeNull();
+      finishDeletion();
+      await leaving;
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

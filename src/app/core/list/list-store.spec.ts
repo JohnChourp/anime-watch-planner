@@ -18,9 +18,11 @@ const fs = vi.mocked(Filesystem);
 const good: CachedList = { version: CACHE_VERSION, userId: 7, fetchedAt: 1, checkedAt: 3, watermark: 2, entries: [] };
 
 describe('ListStore', () => {
-  const store = new ListStore();
+  let store: ListStore;
 
   beforeEach(() => {
+    store = new ListStore();
+    localStorage.clear();
     vi.clearAllMocks();
     fs.readdir.mockResolvedValue({ files: [] });
     fs.deleteFile.mockResolvedValue();
@@ -112,6 +114,40 @@ describe('ListStore', () => {
     fs.writeFile.mockRejectedValueOnce(new Error('no space for a marker'));
     await new ListStore().invalidate();
     expect(fs.deleteFile).toHaveBeenCalledWith(expect.objectContaining({ path: 'anilist-list.json' }));
+  });
+
+  it('sets the marker before an edit and retains it across writes until every uncertainty is resolved', async () => {
+    await store.markBeforeEdit();
+    await store.markBeforeEdit();
+    expect(fs.writeFile).toHaveBeenCalledTimes(1);
+    await store.write(good, true);
+    expect(fs.deleteFile).not.toHaveBeenCalled();
+    expect(store.needsRefresh).toBe(true);
+    await store.write(good);
+    expect(fs.deleteFile).toHaveBeenCalledOnce();
+    expect(fs.rename.mock.invocationCallOrder.at(-1)!).toBeLessThan(fs.deleteFile.mock.invocationCallOrder[0]);
+    expect(store.needsRefresh).toBe(false);
+  });
+
+  it('withholds a read-only list across restart when a refresh confirms a queued change', async () => {
+    fs.writeFile.mockRejectedValueOnce(new Error('read only'));
+    fs.deleteFile.mockRejectedValueOnce(new Error('read only'));
+    await store.invalidate();
+    expect(store.needsRefresh).toBe(true);
+    const restarted = new ListStore();
+    fs.readFile.mockResolvedValue({ data: JSON.stringify(good) });
+    expect(await restarted.read()).toBeNull();
+    expect(fs.readFile).not.toHaveBeenCalled();
+    fs.rename.mockResolvedValue();
+    await restarted.write(good);
+    expect(await new ListStore().read()).toEqual(good);
+  });
+
+  it('reports protection failure without removing a good offline file', async () => {
+    fs.writeFile.mockRejectedValueOnce(new Error('read only'));
+    await expect(store.markBeforeEdit()).rejects.toThrow('read only');
+    expect(fs.deleteFile).not.toHaveBeenCalled();
+    expect(store.needsRefresh).toBe(false);
   });
 
   it('reports a successful write only after the temporary file has its final offline name', async () => {

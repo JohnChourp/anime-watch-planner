@@ -75,7 +75,54 @@ describe('AuthService', () => {
     expect(auth.status()).toBe('signedIn');
     expect(auth.viewer()).toEqual({ id: 7, name: 'Tester' });
     expect(auth.accessToken(now)).toBe('t');
-    expect(platform.saved?.sessionId).toEqual(expect.any(String));
+    expect(auth.sessionId()).toEqual(expect.any(String));
+    expect(platform.saved).toEqual({ accessToken: 't', expiresAt: now + 1000 });
+  });
+
+  it('keeps legacy credentials intact and derives the same offline identity on the next launch', async () => {
+    platform.saved = { accessToken: 'legacy-session', expiresAt: now + 60_000 };
+    const write = vi.spyOn(platform, 'writeToken').mockRejectedValue(new Error('Keychain is not writable'));
+    const remove = vi.spyOn(platform, 'deleteToken');
+    await auth.start(now);
+    const firstId = auth.sessionId();
+    expect(firstId).toBeTruthy();
+    const reopen = () => TestBed.runInInjectionContext(() => new AuthService());
+    const offline = reopen();
+    offline.useFetch(async () => {
+      throw new Error('offline');
+    });
+    await offline.start(now + 1);
+    expect(offline.sessionId()).toBe(firstId);
+    expect(offline.accessToken(now + 1)).toBe('legacy-session');
+    platform.saved = { accessToken: 'different-session', expiresAt: now + 60_000 };
+    const other = reopen();
+    other.useFetch(viewerResponse(200, { data: { Viewer: { id: 8, name: 'Other' } } }));
+    await other.start(now + 1);
+    expect(other.sessionId()).not.toBe(firstId);
+    expect(write).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('withdraws access immediately and shares a delayed device sign-out', async () => {
+    platform.saved = { accessToken: 't', sessionId: 'known-session', expiresAt: now + 1000 };
+    await auth.start(now);
+    let finish!: () => void;
+    const deletion = vi.spyOn(platform, 'deleteToken').mockImplementation(
+      () =>
+        new Promise<void>((r) => {
+          finish = r;
+        }),
+    );
+    const first = auth.signOut();
+    const second = auth.signOut();
+    expect(auth.accessToken(now)).toBeNull();
+    expect(auth.sessionId()).toBeUndefined();
+    expect(auth.viewer()).toBeNull();
+    expect(auth.status()).not.toBe('signedIn');
+    expect(deletion).toHaveBeenCalledTimes(1);
+    finish();
+    await Promise.all([first, second]);
+    expect(auth.status()).toBe('signedOut');
   });
 
   it('restores the same local session identity offline without rewriting the token', async () => {
