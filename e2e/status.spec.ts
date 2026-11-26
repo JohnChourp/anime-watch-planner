@@ -17,6 +17,20 @@ function readOfflineList(page: Page) {
   );
 }
 
+async function simulateFullDisk(page: Page) {
+  // Fail only writes to the list file in this browser. Reads still see the real offline copy.
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (value?.path?.endsWith('/anilist-list.json.tmp') && sessionStorage.getItem('disk-full')) {
+        throw new DOMException('Disk full', 'QuotaExceededError');
+      }
+      return put.call(this, value, key);
+    };
+    sessionStorage.setItem('disk-full', '1');
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   // Restore the session through the web storage adapter in this isolated browser context.
   await page.addInitScript(() =>
@@ -196,6 +210,46 @@ test('explains how to enable editing after an offline start and enables it on pu
   await expect(hint).toHaveCount(0);
 });
 
+test('shows the offline warning when a refresh confirms the selected status before dispatch', async ({ page }) => {
+  let reads = 0;
+  let writes = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  await page.route('https://graphql.anilist.co/**', async (route) => {
+    const { query } = route.request().postDataJSON();
+    if (query.includes('Viewer')) return route.fulfill({ json: { data: { Viewer: { id: 5, name: 'Demo' } } } });
+    if (!query.includes('MediaListCollection')) {
+      writes++;
+      return route.fulfill({ status: 503, json: {} });
+    }
+    reads++;
+    if (reads === 2) await held;
+    const row = entry(11, 'First title', reads === 1 ? 'CURRENT' : 'PAUSED');
+    return route.fulfill({
+      json: { data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: [row] }] } } },
+    });
+  });
+  await page.goto('/');
+  await page.getByLabel('Anime in your list').selectOption('11');
+  await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'CURRENT' }] });
+  await simulateFullDisk(page);
+  await page.locator('ion-refresher').dispatchEvent('ionRefresh');
+  await expect.poll(() => reads).toBe(2);
+  const paused = page.getByRole('button', { name: 'Paused', exact: true });
+  await paused.click();
+  release();
+  const warning = page.getByRole('alert').filter({ hasText: 'offline copy on this device' });
+  await expect(warning).toContainText('First title');
+  await expect(paused).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByText('Saved to AniList.', { exact: true })).toBeVisible();
+  expect(await readOfflineList(page)).toMatchObject({ entries: [{ status: 'CURRENT' }] });
+  await page.evaluate(() => sessionStorage.removeItem('disk-full'));
+  await page.locator('ion-refresher').dispatchEvent('ionRefresh');
+  await expect.poll(() => readOfflineList(page)).toMatchObject({ entries: [{ status: 'PAUSED' }] });
+  await expect(warning).toHaveCount(0);
+  expect(writes).toBe(0);
+});
+
 test('keeps a title-specific storage warning until the offline list is actually repaired', async ({ page }) => {
   const rows = [entry(11, 'First title', 'CURRENT'), entry(22, 'Second title', 'CURRENT')];
   let release!: () => void;
@@ -227,17 +281,7 @@ test('keeps a title-specific storage warning until the offline list is actually 
         { id: 22, status: 'CURRENT' },
       ],
     });
-  // Fail only writes to the list file in this isolated browser. Reads still return the real offline copy.
-  await page.evaluate(() => {
-    const put = IDBObjectStore.prototype.put;
-    IDBObjectStore.prototype.put = function (value, key) {
-      if (value?.path?.endsWith('/anilist-list.json.tmp') && sessionStorage.getItem('disk-full')) {
-        throw new DOMException('Disk full', 'QuotaExceededError');
-      }
-      return put.call(this, value, key);
-    };
-    sessionStorage.setItem('disk-full', '1');
-  });
+  await simulateFullDisk(page);
   const button = (name: string) => page.getByRole('button', { name, exact: true });
   await button('Paused').click();
   await expect.poll(() => writes).toEqual([11]);
@@ -248,6 +292,7 @@ test('keeps a title-specific storage warning until the offline list is actually 
   const warning = page.getByRole('alert').filter({ hasText: 'offline copy on this device' });
   await expect(warning).toContainText('First title');
   await picker.selectOption('11');
+  await expect(page.getByText('Saved to AniList.', { exact: true })).toBeVisible();
   await button('Dropped').click();
   const remoteError = page.getByRole('alert').filter({ hasText: 'Could not confirm' });
   await expect(remoteError).toContainText('First title');

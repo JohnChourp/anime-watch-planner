@@ -564,6 +564,7 @@ describe('ListService', () => {
       expect(list.entries()?.[0].status).toBe('PAUSED');
       expect(store.saved?.entries[0].status).toBe('CURRENT');
       expect(list.unsavedMediaIds().has(1)).toBe(true);
+      expect(list.statusEdits().get(1)).toMatchObject({ pending: null, message: 'Saved to AniList.' });
     });
 
     it.each([true, false])(
@@ -583,7 +584,7 @@ describe('ListService', () => {
         expect(list.entries()?.[0].status).toBe('PAUSED');
         expect(store.saved?.entries[0].status).toBe(stored ? 'PAUSED' : 'CURRENT');
         expect(list.unsavedMediaIds().has(1)).toBe(!stored);
-        expect(list.statusEdits().get(1)?.message).toBe(stored ? 'Saved to AniList.' : undefined);
+        expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
       },
     );
 
@@ -640,6 +641,78 @@ describe('ListService', () => {
       await Promise.all([refresh, middle, last]);
       expect(writes).toEqual(['CURRENT']);
       expect(store.saved?.entries[0].status).toBe('CURRENT');
+    });
+
+    it.each(['delta', 'full'])(
+      'keeps the offline warning when a %s read satisfies the pending choice before dispatch',
+      async (kind) => {
+        const rows = [
+          { ...entry(1, 80), status: 'PAUSED' },
+          { ...entry(2, 75), status: 'DROPPED' },
+        ];
+        const response = listFetch(200, rows, [rows]);
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => (release = resolve));
+        const send = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+          await held;
+          return response.fn(url, init);
+        });
+        list.useFetch(send);
+        vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        const read = kind === 'delta' ? list.sync(me.id, now) : list.refresh(now);
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        const edit = list.changeStatus(1, 'PAUSED');
+        release();
+        await Promise.all([read, edit]);
+        expect(response.calls).toEqual([kind === 'delta' ? 'changes' : 'full']);
+        expect(list.entries()?.[0].status).toBe('PAUSED');
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        expect([...list.unsavedMediaIds()]).toEqual([1]);
+        expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+        await list.refresh(now);
+        expect(list.unsavedMediaIds().size).toBe(0);
+        expect(store.saved?.entries[0].status).toBe('PAUSED');
+      },
+    );
+
+    it('keeps a cancelled tap quiet when a refresh returns the status already saved on the device', async () => {
+      const response = listFetch(200);
+      list.useFetch(response.fn);
+      vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+      const read = list.refresh();
+      const edit = list.changeStatus(1, 'PAUSED');
+      const undo = list.changeStatus(1, 'CURRENT');
+      await Promise.all([read, edit, undo]);
+      expect(response.calls).toEqual(['full']);
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(list.unsavedMediaIds().size).toBe(0);
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+    });
+
+    it('acknowledges an undo confirmed by a refresh after the first change was written to the device', async () => {
+      let reply!: (value: Response) => void;
+      const reads = listFetch(200);
+      const send = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(init?.body).includes('SaveMediaListEntry'))
+          return new Promise<Response>((resolve) => (reply = resolve));
+        return reads.fn(url, init);
+      });
+      list.useFetch(send);
+      const write = store.write.bind(store);
+      vi.spyOn(store, 'write').mockImplementationOnce(write).mockRejectedValueOnce(new Error('disk full'));
+      const first = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const read = list.refresh();
+      const undo = list.changeStatus(1, 'CURRENT');
+      reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 60), status: 'PAUSED' } } }));
+      await Promise.all([first, read, undo]);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(reads.calls).toEqual(['full']);
+      expect(list.entries()?.[0].status).toBe('CURRENT');
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+      expect([...list.unsavedMediaIds()]).toEqual([1]);
+      expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
     });
 
     it.each(['delta', 'full'])(
@@ -710,7 +783,9 @@ describe('ListService', () => {
       await list.changeStatus(1, 'PAUSED');
       write.mockRestore();
       list.useFetch(async () => Response.json({}, { status: 503 }));
-      await list.changeStatus(1, 'DROPPED');
+      const next = list.changeStatus(1, 'DROPPED');
+      expect(list.statusEdits().get(1)).toMatchObject({ pending: 'DROPPED', message: 'Saving to AniList…' });
+      await next;
       expect(list.unsavedMediaIds().has(1)).toBe(true);
       list.useFetch(async () =>
         Response.json({ data: { SaveMediaListEntry: { ...entry(2, 80), status: 'COMPLETED' } } }),

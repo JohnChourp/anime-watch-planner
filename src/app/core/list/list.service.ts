@@ -35,6 +35,8 @@ export class ListService {
   private queuedReads = 0;
   /** Last known status before a dispatched write whose reply may still be missing. */
   private readonly unconfirmedWrites = new Map<number, ListStatus>();
+  /** An earlier response can confirm a specific tap before it reaches the front of the queue. */
+  private readonly confirmedPendingEdits = new WeakSet<StatusEdit>();
   /** Bumped on sign-out, so a refresh that finishes afterwards does not save the old user's list. */
   private generation = 0;
 
@@ -148,13 +150,9 @@ export class ListService {
         });
         return;
       }
+      const remoteConfirmation: StatusEdit = { mediaId, pending: null, message: 'Saved to AniList.' };
       if (existing.status === status && !this.unconfirmedWrites.has(mediaId)) {
-        this.setStatusEdit(
-          id,
-          returnsToDisplayedStatus || this.unsavedMediaIds().has(mediaId)
-            ? null
-            : { mediaId, pending: null, message: 'Saved to AniList.' },
-        );
+        this.setStatusEdit(id, this.confirmedPendingEdits.has(edit) ? remoteConfirmation : null);
         return;
       }
       // The shared gate may wait before dispatch. A newer tap or a sign-out cancels a still-unsent write.
@@ -177,7 +175,7 @@ export class ListService {
         if (confirmed.media.id !== existing.media.id) throw new Error('AniList returned a different title.');
         this.reconcileStatusEdits([confirmed]);
         // Only this entry was checked. Advancing the list watermark could skip other titles changed on AniList.
-        const stored = await this.save(
+        await this.save(
           {
             ...cache,
             entries: cache.entries.map((item) => (item.id === id ? confirmed : item)),
@@ -186,7 +184,7 @@ export class ListService {
         );
         // Newer taps must see the result of any reads queued between the two edits.
         if (sameSession() && current()) {
-          this.setStatusEdit(id, stored ? { mediaId, pending: null, message: 'Saved to AniList.' } : null);
+          this.setStatusEdit(id, remoteConfirmation);
         }
       } catch (error) {
         if (!sameSession()) return;
@@ -372,31 +370,44 @@ export class ListService {
   /** A read confirms the server state. Keep newer taps and feedback for any titles the read did not cover. */
   private reconcileStatusEdits(entries: readonly ListEntry[], fullList = false): number[] {
     if (!this.unconfirmedWrites.size && !this.statusEdits().size) return [];
-    const checked = new Map(entries.map((entry) => [entry.media.id, entry.status]));
-    const changedMediaIds: number[] = [];
+    const checked = new Map(entries.map((entry) => [entry.media.id, entry]));
+    const changedMediaIds = new Set<number>();
     for (const [mediaId, before] of this.unconfirmedWrites) {
       const after = checked.get(mediaId);
-      if (after !== undefined && after !== before) changedMediaIds.push(mediaId);
-      if (fullList || after !== undefined) this.unconfirmedWrites.delete(mediaId);
+      if (after && after.status !== before) changedMediaIds.add(mediaId);
+      if (fullList || after) this.unconfirmedWrites.delete(mediaId);
+    }
+    // A read can satisfy a pending tap before dispatch. Only count a change to the same list entry.
+    const edits = this.statusEdits();
+    for (const before of this.cache?.entries ?? []) {
+      const after = checked.get(before.media.id);
+      const edit = edits.get(before.id);
+      if (
+        after?.id === before.id &&
+        after.status !== before.status &&
+        edit?.mediaId === before.media.id &&
+        edit.pending === after.status
+      ) {
+        this.confirmedPendingEdits.add(edit);
+        changedMediaIds.add(before.media.id);
+      }
     }
     this.statusEdits.update(
       (edits) =>
         new Map([...edits].filter(([, edit]) => edit.pending !== null || (!fullList && !checked.has(edit.mediaId)))),
     );
-    return changedMediaIds;
+    return [...changedMediaIds];
   }
 
-  private async save(list: CachedList, editedMediaIds: readonly number[]): Promise<boolean> {
+  private async save(list: CachedList, editedMediaIds: readonly number[]): Promise<void> {
     this.show(list);
     try {
       await this.store.write(list);
       if (this.cache === list && this.unsavedMediaIds().size) this.unsavedMediaIds.set(new Set());
-      return true;
     } catch {
       if (this.cache === list && editedMediaIds.length) {
         this.unsavedMediaIds.update((ids) => new Set([...ids, ...editedMediaIds]));
       }
-      return false; // Still available in memory.
     }
   }
 
