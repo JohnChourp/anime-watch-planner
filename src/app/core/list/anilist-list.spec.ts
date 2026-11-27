@@ -1,6 +1,6 @@
 import { UnauthorizedError } from '../auth/anilist-viewer';
 
-import { fetchChanges, fetchList, RateLimitedError } from './anilist-list';
+import { fetchChanges, fetchList, RateLimitedError, saveStatus } from './anilist-list';
 
 const raw = (id: number, updatedAt = 100) => ({
   id,
@@ -9,6 +9,8 @@ const raw = (id: number, updatedAt = 100) => ({
   repeat: null,
   updatedAt,
   score: 8.5,
+  startedAt: { year: 2025, month: null, day: null },
+  completedAt: null,
   media: {
     id: id * 10,
     format: 'TV',
@@ -38,6 +40,23 @@ function fakeFetch(responses: { status: number; body: unknown }[]) {
 }
 
 describe('fetchList', () => {
+  it.each([
+    { ...page([raw(1)]), errors: [{ message: 'Group unavailable' }] },
+    { data: { MediaListCollection: { hasNextChunk: false, lists: null } } },
+    { data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: null }] } } },
+    { data: { MediaListCollection: { hasNextChunk: null, lists: [] } } },
+  ])('rejects an incomplete final chunk instead of returning the earlier rows', async (body) => {
+    const { fn } = fakeFetch([
+      { status: 200, body: page([raw(2)], true) },
+      { status: 200, body },
+    ]);
+    await expect(fetchList('tok', 7, fn, 0)).rejects.toThrow();
+  });
+
+  it('accepts a complete empty list', async () => {
+    const { fn } = fakeFetch([{ status: 200, body: page([]) }]);
+    await expect(fetchList('tok', 7, fn)).resolves.toEqual([]);
+  });
   it('reads the whole list in one call and maps the fields', async () => {
     const { fn, calls } = fakeFetch([{ status: 200, body: page([raw(1), raw(2)]) }]);
     const entries = await fetchList('tok', 7, fn);
@@ -48,6 +67,8 @@ describe('fetchList', () => {
       status: 'CURRENT',
       progress: 3,
       score: 8.5,
+      startedAt: { year: 2025, month: null, day: null },
+      completedAt: null,
       repeat: 0,
       updatedAt: 100,
       media: {
@@ -105,6 +126,35 @@ const changesPage = (entries: unknown[], hasNextPage = false) => ({
   data: { Page: { pageInfo: { hasNextPage }, mediaList: entries } },
 });
 
+describe('saveStatus', () => {
+  it('updates an existing entry by id and asks for its confirmed list fields', async () => {
+    const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const sent = JSON.parse(String(init?.body));
+      expect(sent.query).toContain('SaveMediaListEntry(id: $id, status: $status)');
+      expect(sent.variables).toEqual({ id: 3, status: 'PAUSED' });
+      expect(sent.query).toContain('completedAt');
+      return Response.json({ data: { SaveMediaListEntry: { ...raw(3), status: 'PAUSED' } } });
+    });
+    const result = await saveStatus('tok', 3, 'PAUSED', send, {});
+    expect(result).toMatchObject({
+      id: 3,
+      status: 'PAUSED',
+      score: 8.5,
+      startedAt: { year: 2025, month: null, day: null },
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { data: { SaveMediaListEntry: null } },
+    { data: { SaveMediaListEntry: raw(2) } },
+    { data: { SaveMediaListEntry: { ...raw(3), status: 'PLANNING' } } },
+    { data: { SaveMediaListEntry: raw(3) }, errors: [{ message: 'Incomplete result' }] },
+  ])('requires a complete confirmation for the requested entry and status', async (body) => {
+    await expect(saveStatus('tok', 3, 'CURRENT', async () => Response.json(body), {})).rejects.toThrow();
+  });
+});
+
 function pagesFetch(pages: unknown[]) {
   const asked: number[] = [];
   const fn = (async (_url: string, init: RequestInit) => {
@@ -117,6 +167,10 @@ function pagesFetch(pages: unknown[]) {
 }
 
 describe('fetchChanges', () => {
+  it('rejects a partial changes page instead of advancing the watermark', async () => {
+    const { fn } = pagesFetch([{ ...changesPage([raw(1, 300)]), errors: [{ message: 'Partial page' }] }]);
+    await expect(fetchChanges('tok', 7, 200, fn, 0)).rejects.toThrow();
+  });
   it('returns the entries changed since the watermark, the same second included, and stops at the first older one', async () => {
     const { fn, asked } = pagesFetch([
       changesPage([raw(1, 300), raw(2, 200), raw(3, 200), raw(4, 199), raw(5, 400)], true),

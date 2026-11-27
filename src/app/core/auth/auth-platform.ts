@@ -41,9 +41,9 @@ export class AuthPlatform {
   async readToken(): Promise<StoredToken | null> {
     const value = await SecureStorage.get(TOKEN_KEY, false, false);
     if (value && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date)) {
-      const { accessToken, expiresAt } = value as Partial<StoredToken>;
+      const { accessToken, expiresAt, sessionId } = value as Partial<StoredToken>;
       if (typeof accessToken === 'string' && typeof expiresAt === 'number') {
-        return { accessToken, expiresAt };
+        return { accessToken, expiresAt, sessionId: typeof sessionId === 'string' ? sessionId : undefined };
       }
     }
     return null;

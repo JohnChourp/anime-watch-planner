@@ -75,6 +75,84 @@ describe('AuthService', () => {
     expect(auth.status()).toBe('signedIn');
     expect(auth.viewer()).toEqual({ id: 7, name: 'Tester' });
     expect(auth.accessToken(now)).toBe('t');
+    expect(auth.sessionId()).toEqual(expect.any(String));
+    expect(platform.saved).toEqual({ accessToken: 't', expiresAt: now + 1000 });
+  });
+
+  it('keeps legacy credentials intact and derives the same offline identity on the next launch', async () => {
+    platform.saved = { accessToken: 'legacy-session', expiresAt: now + 60_000 };
+    const write = vi.spyOn(platform, 'writeToken').mockRejectedValue(new Error('Keychain is not writable'));
+    const remove = vi.spyOn(platform, 'deleteToken');
+    await auth.start(now);
+    const firstId = auth.sessionId();
+    expect(firstId).toBeTruthy();
+    const reopen = () => TestBed.runInInjectionContext(() => new AuthService());
+    const offline = reopen();
+    offline.useFetch(async () => {
+      throw new Error('offline');
+    });
+    await offline.start(now + 1);
+    expect(offline.sessionId()).toBe(firstId);
+    expect(offline.accessToken(now + 1)).toBe('legacy-session');
+    platform.saved = { accessToken: 'different-session', expiresAt: now + 60_000 };
+    const other = reopen();
+    other.useFetch(viewerResponse(200, { data: { Viewer: { id: 8, name: 'Other' } } }));
+    await other.start(now + 1);
+    expect(other.sessionId()).not.toBe(firstId);
+    expect(write).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('withdraws access immediately and shares a delayed device sign-out', async () => {
+    platform.saved = { accessToken: 't', sessionId: 'known-session', expiresAt: now + 1000 };
+    await auth.start(now);
+    let finish!: () => void;
+    const deletion = vi.spyOn(platform, 'deleteToken').mockImplementation(
+      () =>
+        new Promise<void>((r) => {
+          finish = r;
+        }),
+    );
+    const first = auth.signOut();
+    const second = auth.signOut();
+    expect(auth.accessToken(now)).toBeNull();
+    expect(auth.sessionId()).toBeUndefined();
+    expect(auth.viewer()).toBeNull();
+    expect(auth.status()).not.toBe('signedIn');
+    expect(deletion).toHaveBeenCalledTimes(1);
+    finish();
+    await Promise.all([first, second]);
+    expect(auth.status()).toBe('signedOut');
+  });
+
+  it('restores the same local session identity offline without rewriting the token', async () => {
+    platform.saved = { accessToken: 't', expiresAt: now + 1000, sessionId: 'known-session' };
+    const write = vi.spyOn(platform, 'writeToken');
+    auth.useFetch(async () => {
+      throw new Error('offline');
+    });
+    await auth.start(now);
+    expect(auth.sessionId()).toBe('known-session');
+    expect(auth.viewer()).toBeNull();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it('ignores a delayed viewer result after the session has ended', async () => {
+    platform.saved = { accessToken: 't', expiresAt: now + 1000, sessionId: 'known-session' };
+    let finish!: (response: Response) => void;
+    auth.useFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const start = auth.start(now);
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    await auth.signOut();
+    finish(Response.json({ data: { Viewer: { id: 7, name: 'Demo' } } }));
+    await start;
+    expect(auth.sessionId()).toBeUndefined();
+    expect(auth.viewer()).toBeNull();
   });
 
   it('signs out with a message when the saved token has expired', async () => {
@@ -114,7 +192,8 @@ describe('AuthService', () => {
     const state = await startSignIn();
     await auth.handleRedirect(`com.john.animewatchplanner://auth#access_token=new&expires_in=60&state=${state}`, now);
     expect(platform.pending).toBeNull();
-    expect(platform.saved).toEqual({ accessToken: 'new', expiresAt: now + 60_000 });
+    expect(platform.saved).toEqual({ accessToken: 'new', expiresAt: now + 60_000, sessionId: auth.sessionId() });
+    expect(auth.sessionId()).toEqual(expect.any(String));
     expect(platform.closed).toBe(1);
     expect(auth.status()).toBe('signedIn');
     expect(auth.viewer()?.name).toBe('Tester');

@@ -1,7 +1,9 @@
 import { signal } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 
+import { anilistGate } from '../anilist/anilist-gate';
 import type { Viewer } from '../auth/anilist-viewer';
+import { AuthPlatform } from '../auth/auth-platform';
 import type { AuthStatus } from '../auth/auth.service';
 import { AuthService } from '../auth/auth.service';
 
@@ -9,6 +11,7 @@ import { CACHE_VERSION, ListStore, type CachedList } from './list-store';
 import { CHANGES_INTERVAL_MS, LIST_TTL_MS, ListService } from './list.service';
 
 class FakeAuth {
+  sessionId = signal('test-session');
   status = signal<AuthStatus>('loading');
   viewer = signal<Viewer | null>(null);
   token: string | null = 'tok';
@@ -28,19 +31,31 @@ class FakeAuth {
 }
 
 class FakeStore {
+  needsRefresh = false;
   saved: CachedList | null = null;
   writes = 0;
   deletes = 0;
   async read() {
-    return this.saved;
+    return this.needsRefresh ? null : this.saved;
   }
-  async write(list: CachedList) {
+  async write(list: CachedList, keepMarker = false) {
     this.writes++;
     this.saved = list;
+    this.needsRefresh = keepMarker;
+  }
+  async markBeforeEdit() {
+    this.needsRefresh = true;
+  }
+  async clearMarker() {
+    this.needsRefresh = false;
+  }
+  async invalidate() {
+    this.needsRefresh = true;
   }
   async delete() {
     this.deletes++;
     this.saved = null;
+    this.needsRefresh = false;
   }
 }
 
@@ -72,6 +87,7 @@ function listFetch(status: number, entries = [entry(1, 50), entry(2, 90)], chang
 
 const saved = (userId: number, fetchedAt: number, checkedAt = fetchedAt): CachedList => ({
   version: CACHE_VERSION,
+  sessionId: 'test-session',
   userId,
   fetchedAt,
   checkedAt,
@@ -153,6 +169,29 @@ describe('ListService', () => {
     await list.refresh(now + 1);
     expect(calls.length).toBe(1);
     expect(list.fetchedAt()).toBe(now + 1);
+  });
+
+  it.each([undefined, 'earlier-session'])(
+    'requires online owner verification for an unbound cache (%s)',
+    async (sessionId) => {
+      store.saved = { ...saved(me.id, now), sessionId };
+      await list.sync(null, now);
+      expect(list.entries()).toBeNull();
+      const { fn, calls } = listFetch(200);
+      list.useFetch(fn);
+      await list.sync(me.id, now);
+      expect(list.entries()).toHaveLength(2);
+      expect(store.saved?.sessionId).toBe(auth.sessionId());
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it('hides a verified offline list immediately when the active session changes', async () => {
+    store.saved = saved(me.id, now);
+    await list.sync(null, now);
+    expect(list.entries()).toHaveLength(2);
+    auth.sessionId.set('new-session');
+    expect(list.entries()).toBeNull();
   });
 
   it('pull-to-refresh while AniList cannot be reached says so', async () => {
@@ -390,5 +429,648 @@ describe('ListService', () => {
     TestBed.tick();
     await vi.waitFor(() => expect(store.deletes).toBeGreaterThan(0));
     expect(list.entries()).toBeNull();
+  });
+
+  describe('changing the status of an existing entry', () => {
+    beforeEach(async () => {
+      store.saved = saved(me.id, Date.now());
+      auth.viewer.set(me);
+      auth.status.set('signedIn');
+      TestBed.tick();
+      await list.sync(me.id);
+    });
+
+    it('sends the last rapid choice per title, merges each confirmation, and keeps the list watermark', async () => {
+      const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        const { id, status } = JSON.parse(String(init?.body)).variables;
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(id, 105), status, progress: 7 } } });
+      });
+      list.useFetch(send);
+      const initial = store.saved!;
+      await Promise.all([
+        list.changeStatus(1, 'PLANNING'),
+        list.changeStatus(1, 'PAUSED'),
+        list.changeStatus(2, 'REPEATING'),
+      ]);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(store.saved?.entries.map((e) => [e.status, e.progress])).toEqual([
+        ['PAUSED', 7],
+        ['REPEATING', 7],
+      ]);
+      expect(store.saved).toMatchObject({
+        watermark: initial.watermark,
+        checkedAt: initial.checkedAt,
+        fetchedAt: initial.fetchedAt,
+      });
+      expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+    });
+
+    it('cancels a quick return to the saved status without sending any mutation', async () => {
+      const send = vi.fn(listFetch(500).fn);
+      list.useFetch(send);
+      const first = list.changeStatus(1, 'PAUSED');
+      await list.changeStatus(1, 'CURRENT');
+      await first;
+      expect(send).not.toHaveBeenCalled();
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(store.writes).toBe(0);
+    });
+
+    it('accepts an explicit undo after a lost reply and suppresses a repeat once confirmed', async () => {
+      const writes: string[] = [];
+      list.useFetch(async (_, init) => {
+        const { id, status } = JSON.parse(String(init?.body)).variables;
+        writes.push(status);
+        if (writes.length === 1) throw new Error('Lost reply');
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(id, 112), status } } });
+      });
+      await list.changeStatus(1, 'PAUSED');
+      expect(list.canSelectStatus(list.entries()![0], 'CURRENT')).toBe(true);
+      await list.changeStatus(1, 'CURRENT');
+      expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+      await list.changeStatus(1, 'CURRENT');
+      expect(writes).toEqual(['PAUSED', 'CURRENT']);
+    });
+
+    it('keeps a queued edit and its row when a refresh returns only part of a list', async () => {
+      let finish!: (response: Response) => void;
+      const incomplete = new Promise<Response>((resolve) => (finish = resolve));
+      const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(init?.body).includes('MediaListCollection')) return incomplete;
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 112), status: 'PAUSED' } } });
+      });
+      list.useFetch(send);
+      const refresh = list.refresh();
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+      const edit = list.changeStatus(1, 'PAUSED');
+      finish(Response.json({ data: { MediaListCollection: { hasNextChunk: false, lists: [{ entries: null }] } } }));
+      await Promise.all([refresh, edit]);
+      expect(list.entries()?.map((row) => row.id)).toEqual([1, 2]);
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+      expect(send).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps recovery pending across an unrelated edit and a delta that omits the uncertain title', async () => {
+      list.useFetch(async (_, init) => {
+        const { id, status } = JSON.parse(String(init?.body)).variables;
+        if (id === 1) throw new Error('Lost reply');
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(id, 110), status } } });
+      });
+      await list.changeStatus(1, 'PAUSED');
+      expect(store.needsRefresh).toBe(true);
+      await list.changeStatus(2, 'COMPLETED');
+      expect(store.needsRefresh).toBe(true);
+      list.useFetch(listFetch(200).fn);
+      await list.sync(me.id, store.saved!.checkedAt + CHANGES_INTERVAL_MS);
+      expect(store.needsRefresh).toBe(true);
+      list.useFetch(
+        listFetch(200, [
+          { ...entry(1, 105), status: 'PAUSED' },
+          { ...entry(2, 110), status: 'COMPLETED' },
+        ]).fn,
+      );
+      await list.refresh();
+      expect(store.needsRefresh).toBe(false);
+      expect(store.saved?.entries.map((row) => row.status)).toEqual(['PAUSED', 'COMPLETED']);
+    });
+
+    it('retains a clean offline copy when local protection fails before dispatch', async () => {
+      vi.spyOn(store, 'markBeforeEdit').mockRejectedValueOnce(new Error('read-only storage'));
+      const send = vi.fn(async () =>
+        Response.json({ data: { SaveMediaListEntry: { ...entry(1, 90), status: 'PAUSED' } } }),
+      );
+      list.useFetch(send);
+      await list.changeStatus(1, 'PAUSED');
+      expect(send).not.toHaveBeenCalled();
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+      expect(list.statusEdits().get(1)?.message).toContain('No change was sent');
+      await list.changeStatus(1, 'PAUSED');
+      expect(send).toHaveBeenCalledOnce();
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+    });
+
+    it.each([true, false])(
+      'only dispatches an edit still wanted after the rate limit resets (cancel: %s)',
+      async (cancel) => {
+        vi.useFakeTimers();
+        try {
+          await anilistGate.send(
+            async () => new Response(null, { status: 429, headers: { 'Retry-After': '1' } }),
+            '/',
+            {},
+          );
+          const send = vi.fn(async () =>
+            Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }),
+          );
+          list.useFetch(send);
+          const first = list.changeStatus(1, 'PAUSED');
+          await vi.advanceTimersByTimeAsync(250);
+          expect(list.statusEdits().get(1)?.message).toContain('Waiting');
+          await vi.advanceTimersByTimeAsync(749);
+          expect(send).not.toHaveBeenCalled();
+          if (cancel) await list.changeStatus(1, 'CURRENT');
+          await vi.advanceTimersByTimeAsync(1);
+          await first;
+          expect(send).toHaveBeenCalledTimes(cancel ? 0 : 1);
+          expect(store.saved?.entries[0].status).toBe(cancel ? 'CURRENT' : 'PAUSED');
+          if (cancel) expect(list.statusEdits().has(1)).toBe(false);
+        } finally {
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it.each(['confirmed', 'confirmed after undo', 'lost'])(
+      'sends the undo when the first request was dispatched and its reply is %s',
+      async (outcome) => {
+        let reply!: (response: Response) => void;
+        const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const { status } = JSON.parse(String(init?.body)).variables;
+          if (status === 'PAUSED') return new Promise<Response>((resolve) => (reply = resolve));
+          return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 62), status } } });
+        });
+        list.useFetch(send);
+        const first = list.changeStatus(1, 'PAUSED');
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        const intermediate = list.changeStatus(1, 'DROPPED');
+        const earlyUndo = outcome === 'confirmed after undo' ? list.changeStatus(1, 'CURRENT') : undefined;
+        reply(
+          outcome !== 'lost'
+            ? Response.json({ data: { SaveMediaListEntry: { ...entry(1, 61), status: 'PAUSED' } } })
+            : Response.json({}, { status: 503 }),
+        );
+        await first;
+        await Promise.all([intermediate, earlyUndo ?? list.changeStatus(1, 'CURRENT')]);
+        expect(send.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).variables.status)).toEqual([
+          'PAUSED',
+          'CURRENT',
+        ]);
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+      },
+    );
+
+    it('clears a pending selection on failure, retains the confirmed row and lets the user retry', async () => {
+      const original = store.saved;
+      list.useFetch(async () => Response.json({}, { status: 500 }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(store.saved).toBe(original);
+      expect(list.statusEdits().get(1)).toMatchObject({
+        pending: null,
+        message: expect.stringContaining('Could not confirm'),
+      });
+      list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: { ...entry(1, 62), status: 'PAUSED' } } }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+      expect(store.saved?.entries[1]).toBe(original?.entries[1]);
+    });
+
+    it('never sends a queued change for a different account, a missing entry or a signed-out session', async () => {
+      const send = vi.fn(listFetch(200, [entry(90, 60)]).fn);
+      list.useFetch(send);
+      await list.changeStatus(99, 'PAUSED');
+      const pending = list.changeStatus(1, 'PAUSED');
+      auth.viewer.set({ id: 9, name: 'other' });
+      await pending;
+      await list.changeStatus(1, 'PAUSED');
+      auth.viewer.set(me);
+      const last = list.changeStatus(1, 'DROPPED');
+      await list.clear();
+      await last;
+      expect(send.mock.calls.filter(([, init]) => String(init?.body).includes('SaveMediaListEntry'))).toHaveLength(0);
+      expect(list.statusEdits().size).toBe(0);
+    });
+
+    it('does not restore a signed-out list when an in-flight write answers', async () => {
+      let release!: (response: Response) => void;
+      const send = vi.fn(() => new Promise<Response>((resolve) => (release = resolve)));
+      list.useFetch(send);
+      const pending = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const clear = list.clear();
+      release(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 60), status: 'PAUSED' } } }));
+      await Promise.all([clear, pending]);
+      expect(list.entries()).toBeNull();
+      expect(store.saved).toBeNull();
+      expect(list.statusEdits().size).toBe(0);
+    });
+
+    it('reports a 429 without replaying the write, and a 401 asks for sign-in again', async () => {
+      const limited = vi.fn(async () => Response.json({}, { status: 429, headers: { 'Retry-After': '1' } }));
+      list.useFetch(limited);
+      await list.changeStatus(1, 'PAUSED');
+      expect(limited).toHaveBeenCalledTimes(1);
+      expect(list.statusEdits().get(1)?.message).toContain('busy');
+      list.useFetch(async () => Response.json({}, { status: 401 }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(auth.expired).toBe(1);
+    });
+
+    it('distinguishes a confirmed remote change from a failed device save', async () => {
+      store.write = async () => {
+        throw new Error('disk full');
+      };
+      list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+      await list.changeStatus(1, 'PAUSED');
+      expect(list.entries()?.[0].status).toBe('PAUSED');
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+      expect(list.unsavedMediaIds().has(1)).toBe(true);
+      expect(list.statusEdits().get(1)).toMatchObject({ pending: null, message: 'Saved to AniList.' });
+    });
+
+    it.each([true, false])(
+      'keeps the result of the one dispatched request on a matching last tap (disk works: %s)',
+      async (stored) => {
+        let reply!: (response: Response) => void;
+        const send = vi.fn(() => new Promise<Response>((resolve) => (reply = resolve)));
+        list.useFetch(send);
+        if (!stored) vi.spyOn(store, 'write').mockRejectedValue(new Error('disk full'));
+        const first = list.changeStatus(1, 'PAUSED');
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        const middle = list.changeStatus(1, 'DROPPED');
+        const last = list.changeStatus(1, 'PAUSED');
+        reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+        await Promise.all([first, middle, last]);
+        expect(send).toHaveBeenCalledTimes(1);
+        expect(list.entries()?.[0].status).toBe('PAUSED');
+        expect(store.saved?.entries[0].status).toBe(stored ? 'PAUSED' : 'CURRENT');
+        expect(list.unsavedMediaIds().has(1)).toBe(!stored);
+        expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+      },
+    );
+
+    it.each(['CURRENT', 'PAUSED'])('honours the last tap after a queued refresh returns %s', async (remoteStatus) => {
+      let reply!: (response: Response) => void;
+      const writes: string[] = [];
+      let remote = 'CURRENT';
+      const reads = listFetch(200, [{ ...entry(1, 75), status: remoteStatus }]);
+      list.useFetch(async (url, init) => {
+        const { query, variables } = JSON.parse(String(init?.body));
+        if (!query.includes('SaveMediaListEntry')) {
+          remote = remoteStatus;
+          return reads.fn(url, init);
+        }
+        writes.push(variables.status);
+        remote = variables.status;
+        if (writes.length === 1) return new Promise<Response>((resolve) => (reply = resolve));
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 80), status: remote } } });
+      });
+      const first = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(writes).toEqual(['PAUSED']));
+      const refresh = list.refresh();
+      const middle = list.changeStatus(1, 'DROPPED');
+      const last = list.changeStatus(1, 'PAUSED');
+      reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+      await Promise.all([first, refresh, middle, last]);
+      expect(reads.calls).toEqual(['full']);
+      expect(writes).toEqual(remoteStatus === 'CURRENT' ? ['PAUSED', 'PAUSED'] : ['PAUSED']);
+      expect(remote).toBe('PAUSED');
+      expect(list.entries()?.[0].status).toBe('PAUSED');
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+    });
+
+    it('rechecks a return to the displayed status while a read is in flight', async () => {
+      let reply!: (response: Response) => void;
+      const writes: string[] = [];
+      list.useFetch(async (_url, init) => {
+        const { query, variables } = JSON.parse(String(init?.body));
+        if (!query.includes('SaveMediaListEntry')) return new Promise<Response>((resolve) => (reply = resolve));
+        writes.push(variables.status);
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 80), status: variables.status } } });
+      });
+      const refresh = list.refresh();
+      await vi.waitFor(() => expect(reply).toBeDefined());
+      const middle = list.changeStatus(1, 'DROPPED');
+      const last = list.changeStatus(1, 'CURRENT');
+      reply(
+        Response.json({
+          data: {
+            MediaListCollection: { hasNextChunk: false, lists: [{ entries: [{ ...entry(1, 75), status: 'PAUSED' }] }] },
+          },
+        }),
+      );
+      await Promise.all([refresh, middle, last]);
+      expect(writes).toEqual(['CURRENT']);
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+    });
+
+    it.each(['delta', 'full'])(
+      'keeps the offline warning when a %s read satisfies the pending choice before dispatch',
+      async (kind) => {
+        const rows = [
+          { ...entry(1, 80), status: 'PAUSED' },
+          { ...entry(2, 75), status: 'DROPPED' },
+        ];
+        const response = listFetch(200, rows, [rows]);
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => (release = resolve));
+        const send = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+          await held;
+          return response.fn(url, init);
+        });
+        list.useFetch(send);
+        vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        const read = kind === 'delta' ? list.sync(me.id, now) : list.refresh(now);
+        await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+        const edit = list.changeStatus(1, 'PAUSED');
+        release();
+        await Promise.all([read, edit]);
+        expect(response.calls).toEqual([kind === 'delta' ? 'changes' : 'full']);
+        expect(list.entries()?.[0].status).toBe('PAUSED');
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        expect([...list.unsavedMediaIds()]).toEqual([1]);
+        expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+        await list.refresh(now);
+        expect(list.unsavedMediaIds().size).toBe(0);
+        expect(store.saved?.entries[0].status).toBe('PAUSED');
+      },
+    );
+
+    it('keeps a cancelled tap quiet when a refresh returns the status already saved on the device', async () => {
+      const response = listFetch(200);
+      list.useFetch(response.fn);
+      vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+      const read = list.refresh();
+      const edit = list.changeStatus(1, 'PAUSED');
+      const undo = list.changeStatus(1, 'CURRENT');
+      await Promise.all([read, edit, undo]);
+      expect(response.calls).toEqual(['full']);
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(list.unsavedMediaIds().size).toBe(0);
+      expect(store.saved?.entries[0].status).toBe('CURRENT');
+    });
+
+    it('acknowledges an undo confirmed by a refresh after the first change was written to the device', async () => {
+      let reply!: (value: Response) => void;
+      const reads = listFetch(200);
+      const send = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(init?.body).includes('SaveMediaListEntry'))
+          return new Promise<Response>((resolve) => (reply = resolve));
+        return reads.fn(url, init);
+      });
+      list.useFetch(send);
+      const write = store.write.bind(store);
+      vi.spyOn(store, 'write').mockImplementationOnce(write).mockRejectedValueOnce(new Error('disk full'));
+      const first = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const read = list.refresh();
+      const undo = list.changeStatus(1, 'CURRENT');
+      reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 60), status: 'PAUSED' } } }));
+      await Promise.all([first, read, undo]);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(reads.calls).toEqual(['full']);
+      expect(list.entries()?.[0].status).toBe('CURRENT');
+      expect(store.saved?.entries[0].status).toBe('PAUSED');
+      expect([...list.unsavedMediaIds()]).toEqual([1]);
+      expect(list.statusEdits().get(1)?.message).toBe('Saved to AniList.');
+    });
+
+    it.each(['delta', 'full'])(
+      'warns only for edited titles first confirmed by a %s read that the device cannot save',
+      async (kind) => {
+        list.useFetch(async () => {
+          throw new TypeError('reply lost');
+        });
+        await list.changeStatus(1, 'PAUSED');
+        expect(list.statusEdits().get(1)?.problem).toBe(true);
+        const changes = [
+          { ...entry(1, 80), status: 'PAUSED' },
+          { ...entry(2, 75), status: 'DROPPED' },
+        ];
+        list.useFetch(listFetch(200, changes, [changes]).fn);
+        vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        if (kind === 'delta') await list.sync(me.id, now);
+        else await list.refresh(now);
+        expect(list.entries()?.[0].status).toBe('PAUSED');
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        expect(list.statusEdits().has(1)).toBe(false);
+        expect([...list.unsavedMediaIds()]).toEqual([1]);
+        await list.refresh(now);
+        expect(store.saved?.entries[0].status).toBe('PAUSED');
+        expect(list.unsavedMediaIds().size).toBe(0);
+      },
+    );
+
+    it('does not flag the offline copy when the read confirms the original status after a lost reply', async () => {
+      list.useFetch(async () => {
+        throw new TypeError('reply lost');
+      });
+      await list.changeStatus(1, 'PAUSED');
+      list.useFetch(listFetch(200).fn);
+      vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+      await list.refresh();
+      expect(list.entries()?.[0].status).toBe('CURRENT');
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(list.unsavedMediaIds().size).toBe(0);
+    });
+
+    it.each(['delta', 'full'])(
+      'retains a device warning across a failed %s save and clears it only when the whole file is written',
+      async (kind) => {
+        const write = vi.spyOn(store, 'write').mockRejectedValue(new Error('disk full'));
+        const confirmed = { ...entry(1, 70), status: 'PAUSED' };
+        list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: confirmed } }));
+        await list.changeStatus(1, 'PAUSED');
+        list.useFetch(listFetch(200, [confirmed, entry(2, 50)], [[confirmed]]).fn);
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        if (kind === 'delta') await list.sync(me.id, now);
+        else await list.refresh(now);
+        expect(list.unsavedMediaIds().has(1)).toBe(true);
+        expect(store.saved?.entries[0].status).toBe('CURRENT');
+        write.mockRestore();
+        // The next delta only mentions title 2, but the file contains both titles.
+        list.useFetch(listFetch(200, [], [[entry(2, 85)]]).fn);
+        await list.sync(me.id, now + CHANGES_INTERVAL_MS);
+        expect(store.saved?.entries[0].status).toBe('PAUSED');
+        expect(list.unsavedMediaIds().size).toBe(0);
+      },
+    );
+
+    it('a successful edit on another title repairs the device copy without clearing an unrelated remote error', async () => {
+      const write = vi.spyOn(store, 'write').mockRejectedValueOnce(new Error('disk full'));
+      list.useFetch(async () => Response.json({ data: { SaveMediaListEntry: { ...entry(1, 65), status: 'PAUSED' } } }));
+      await list.changeStatus(1, 'PAUSED');
+      write.mockRestore();
+      list.useFetch(async () => Response.json({}, { status: 503 }));
+      const next = list.changeStatus(1, 'DROPPED');
+      expect(list.statusEdits().get(1)).toMatchObject({ pending: 'DROPPED', message: 'Saving to AniList…' });
+      await next;
+      expect(list.unsavedMediaIds().has(1)).toBe(true);
+      list.useFetch(async () =>
+        Response.json({ data: { SaveMediaListEntry: { ...entry(2, 80), status: 'COMPLETED' } } }),
+      );
+      await list.changeStatus(2, 'COMPLETED');
+      expect(list.unsavedMediaIds().size).toBe(0);
+      expect(list.statusEdits().get(1)?.message).toContain('Could not confirm');
+      expect(store.saved?.entries.map((item) => item.status)).toEqual(['PAUSED', 'COMPLETED']);
+    });
+
+    it.each(['edit', 'delta'])(
+      'retires an old-entry warning when the replacement is confirmed by a later %s',
+      async (action) => {
+        const replacement = entry(3, 70, 1);
+        const delta = listFetch(200, [], [[replacement]]);
+        list.useFetch(delta.fn);
+        const pending = list.changeStatus(1, 'PAUSED');
+        const now = store.saved!.checkedAt + CHANGES_INTERVAL_MS;
+        await list.sync(me.id, now);
+        await pending;
+        expect(delta.calls).toEqual(['changes']);
+        expect(list.statusEdits().get(1)?.message).toContain('replaced');
+        expect(list.entries()?.find((item) => item.id === 3)?.status).toBe('CURRENT');
+        if (action === 'delta') {
+          await list.sync(me.id, now + CHANGES_INTERVAL_MS);
+          expect(delta.calls).toEqual(['changes', 'changes']);
+        } else {
+          const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+            expect(JSON.parse(String(init?.body)).variables).toEqual({ id: 3, status: 'PAUSED' });
+            return Response.json({ data: { SaveMediaListEntry: { ...replacement, status: 'PAUSED' } } });
+          });
+          list.useFetch(send);
+          await list.changeStatus(3, 'PAUSED');
+          expect(send).toHaveBeenCalledTimes(1);
+          expect(list.statusEdits().get(3)?.message).toBe('Saved to AniList.');
+        }
+        expect(list.statusEdits().has(1)).toBe(false);
+      },
+    );
+
+    it.each([1, 3])('clears only the settled error for the anime returned on resume (entry %i)', async (returnedId) => {
+      list.useFetch(async () => {
+        throw new Error('Reply lost');
+      });
+      await Promise.all([list.changeStatus(1, 'PAUSED'), list.changeStatus(2, 'DROPPED')]);
+      expect(list.statusEdits().get(1)?.message).toContain('Could not confirm');
+      const updated = { ...entry(returnedId, 70, 1), status: 'PAUSED' };
+      const delta = listFetch(200, [], [[updated]]);
+      list.useFetch(delta.fn);
+      list.resume(store.saved!.checkedAt + CHANGES_INTERVAL_MS);
+      await vi.waitFor(() => expect(list.entries()?.find((item) => item.id === returnedId)?.status).toBe('PAUSED'));
+      expect(delta.calls).toEqual(['changes']);
+      expect(list.statusEdits().has(1)).toBe(false);
+      expect(list.statusEdits().get(2)?.message).toContain('Could not confirm');
+    });
+
+    it('keeps a newer pending edit when a delta is received for the same entry', async () => {
+      let reply!: (response: Response) => void;
+      const send = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(init?.body).includes('UPDATED_TIME_DESC'))
+          return new Promise<Response>((resolve) => (reply = resolve));
+        return Response.json({ data: { SaveMediaListEntry: { ...entry(1, 80), status: 'DROPPED' } } });
+      });
+      list.useFetch(send);
+      const sync = list.sync(me.id, store.saved!.checkedAt + CHANGES_INTERVAL_MS);
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const pending = list.changeStatus(1, 'DROPPED');
+      reply(
+        Response.json({
+          data: { Page: { pageInfo: { hasNextPage: false }, mediaList: [{ ...entry(1, 70), status: 'PAUSED' }] } },
+        }),
+      );
+      await sync;
+      expect(list.statusEdits().get(1)?.pending).toBe('DROPPED');
+      await pending;
+      expect(store.saved?.entries[0].status).toBe('DROPPED');
+    });
+
+    it('keeps a later choice on the same title when the first confirmation arrives', async () => {
+      let reply!: (response: Response) => void;
+      const send = vi
+        .fn()
+        .mockImplementationOnce(() => new Promise<Response>((r) => (reply = r)))
+        .mockResolvedValueOnce(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 62), status: 'DROPPED' } } }));
+      list.useFetch(send);
+      const first = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const last = list.changeStatus(1, 'DROPPED');
+      reply(Response.json({ data: { SaveMediaListEntry: { ...entry(1, 61), status: 'PAUSED' } } }));
+      await first;
+      expect(list.statusEdits().get(1)?.pending).toBe('DROPPED');
+      await last;
+      expect(store.saved?.entries[0].status).toBe('DROPPED');
+      expect(list.statusEdits().get(1)?.pending).toBe(null);
+    });
+  });
+});
+
+describe('ListService with the device session', () => {
+  const now = 5_000_000_000;
+  const expiresAt = now + 60_000;
+  let auth: AuthService;
+  let list: ListService;
+  let store: FakeStore;
+  let finishDeletion: () => void;
+
+  beforeEach(() => {
+    store = new FakeStore();
+    store.saved = saved(7, now);
+    const platform = {
+      onRedirect: async () => undefined,
+      onSignInClosed: async () => undefined,
+      launchUrl: async () => null,
+      readToken: async () => ({ accessToken: 'local-test-session', sessionId: 'test-session', expiresAt }),
+      deleteToken: () =>
+        new Promise<void>((resolve) => {
+          finishDeletion = resolve;
+        }),
+    };
+    TestBed.configureTestingModule({
+      providers: [
+        { provide: AuthPlatform, useValue: platform },
+        { provide: ListStore, useValue: store },
+      ],
+    });
+    auth = TestBed.inject(AuthService);
+    list = TestBed.inject(ListService);
+  });
+
+  it('checks local expiry on resume before showing the offline list, without contacting AniList', async () => {
+    const offline = vi.fn(async () => {
+      throw new Error('offline');
+    });
+    auth.useFetch(offline);
+    list.useFetch(offline);
+    await auth.start(now);
+    await list.sync(null, now);
+    expect(list.entries()).toHaveLength(2);
+    list.resume(expiresAt - 1);
+    expect(list.entries()).toHaveLength(2);
+    list.resume(expiresAt);
+    expect(list.entries()).toBeNull();
+    expect(auth.accessToken(expiresAt)).toBeNull();
+    expect(offline).toHaveBeenCalledTimes(1); // Initial viewer check only.
+    finishDeletion();
+    await vi.waitFor(() => expect(auth.status()).toBe('signedOut'));
+  });
+
+  it('cancels a queued edit on sign-out even while native credential deletion is unfinished', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    let allowDispatch!: () => void;
+    const preparation = vi.spyOn(store, 'markBeforeEdit').mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          allowDispatch = resolve;
+        }),
+    );
+    const send = vi.fn(async () => Response.json({}));
+    list.useFetch(send);
+    auth.useFetch(async () => Response.json({ data: { Viewer: { id: 7, name: 'Demo' } } }));
+    try {
+      await auth.start(now);
+      await list.sync(7, now);
+      const edit = list.changeStatus(1, 'PAUSED');
+      await vi.waitFor(() => expect(preparation).toHaveBeenCalledOnce());
+      const leaving = auth.signOut();
+      allowDispatch();
+      await edit;
+      expect(send).not.toHaveBeenCalled();
+      expect(list.entries()).toBeNull();
+      finishDeletion();
+      await leaving;
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
